@@ -18,7 +18,7 @@ void uriencode_init(void) {
         if (isalnum(x) || x == '-' || x == '.' || x == '_' || x == '~') {
             uriencode_map[x] = NULL;
         } else {
-            snprintf(str, 4, "%%%02hhX", (unsigned char)x);
+       //     snprintf(str, 4, "%%%02X", x);
             uriencode_map[x] = str;
             str += 3; /* lobbing off the \0 is fine */
         }
@@ -29,7 +29,7 @@ bool uriencode(const char *src, char *dst, const size_t srclen, const size_t dst
     int x;
     size_t d = 0;
     for (x = 0; x < srclen; x++) {
-        if (d + 4 > dstlen)
+        if (d + 4 >= dstlen)
             return false;
         if (uriencode_map[(unsigned char) src[x]] != NULL) {
             memcpy(&dst[d], uriencode_map[(unsigned char) src[x]], 3);
@@ -52,36 +52,6 @@ bool safe_strtoull(const char *str, uint64_t *out) {
     *out = 0;
     char *endptr;
     unsigned long long ull = strtoull(str, &endptr, 10);
-    if ((errno == ERANGE) || (str == endptr)) {
-        return false;
-    }
-
-    if (xisspace(*endptr) || (*endptr == '\0' && endptr != str)) {
-        if ((long long) ull < 0) {
-            /* only check for negative signs in the uncommon case when
-             * the unsigned number is so big that it's negative as a
-             * signed number. */
-            if (strchr(str, '-') != NULL) {
-                return false;
-            }
-        }
-        *out = ull;
-        return true;
-    }
-    return false;
-}
-
-/* Could macro this. Decided to keep this unrolled for safety rather than add
- * the base parameter to all callers. Very few places need to parse a number
- * outside of base 10, currently exactly once, so splitting this up should
- * help avoid typo bugs.
- */
-bool safe_strtoull_hex(const char *str, uint64_t *out) {
-    assert(out != NULL);
-    errno = 0;
-    *out = 0;
-    char *endptr;
-    unsigned long long ull = strtoull(str, &endptr, 16);
     if ((errno == ERANGE) || (str == endptr)) {
         return false;
     }
@@ -162,62 +132,6 @@ bool safe_strtol(const char *str, int32_t *out) {
         return true;
     }
     return false;
-}
-
-bool safe_strtod(const char *str, double *out) {
-    assert(out != NULL);
-    errno = 0;
-    *out = 0;
-    char *endptr;
-    double d = strtod(str, &endptr);
-    if ((errno == ERANGE) || (str == endptr)) {
-        return false;
-    }
-
-    if (xisspace(*endptr) || (*endptr == '\0' && endptr != str)) {
-        *out = d;
-        return true;
-    }
-    return false;
-}
-
-// slow, safe function for copying null terminated buffers.
-// ensures null terminator set on destination buffer. copies at most dstmax-1
-// non-null bytes.
-// Explicitly avoids over-reading src while looking for the null byte.
-// returns true if src was fully copied.
-// returns false if src was truncated into dst.
-bool safe_strcpy(char *dst, const char *src, const size_t dstmax) {
-   size_t x;
-
-   for (x = 0; x < dstmax - 1 && src[x] != '\0'; x++) {
-        dst[x] = src[x];
-   }
-
-   dst[x] = '\0';
-
-   if (src[x] == '\0') {
-       return true;
-   } else {
-       return false;
-   }
-}
-
-bool safe_memcmp(const void *a, const void *b, size_t len) {
-    const volatile unsigned char *ua = (const volatile unsigned char *)a;
-    const volatile unsigned char *ub = (const volatile unsigned char *)b;
-    int delta = 0;
-    size_t x;
-
-    for (x = 0; x < len; x++) {
-        delta |= ua[x] ^ ub[x];
-    }
-
-    if (delta == 0) {
-        return true;
-    } else {
-        return false;
-    }
 }
 
 void vperror(const char *fmt, ...) {

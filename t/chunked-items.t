@@ -32,7 +32,7 @@ for (1..5) {
     my $data = "x" x $size;
     print $sock "set foo$_ 0 0 $size\r\n$data\r\n";
     my $res = <$sock>;
-    is($res, "STORED\r\n", "stored some big items: $size");
+    is($res, "STORED\r\n", "stored some big items");
 }
 
 {
@@ -75,7 +75,7 @@ for (1..5) {
         $str .= $todo;
         my $len = length($todo);
         print $sock "append appender 0 0 $len\r\n$todo\r\n";
-        is(scalar <$sock>, "STORED\r\n", "append $todo size $len");
+        is(scalar <$sock>, "STORED\r\n", "appened $todo size $len");
         print $sock "get appender\r\n";
         my $header = scalar <$sock>;
         my $body = scalar <$sock>;

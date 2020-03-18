@@ -2,12 +2,12 @@
 
 use strict;
 use warnings;
-use Test::More;
+use Test::More tests => 4945;
 use FindBin qw($Bin);
 use lib "$Bin/lib";
 use MemcachedTest;
 
-my $server = new_memcached("-o no_modern");
+my $server = new_memcached();
 ok($server, "started the server");
 
 # Based almost 100% off testClient.py which is:
@@ -121,8 +121,8 @@ $empty->('x');
 $empty->('y');
 
 {
-    diag "Some chunked item tests";
-    my $s2 = new_memcached('-o no_modern,slab_chunk_max=4096');
+    # diag "Some chunked item tests";
+    my $s2 = new_memcached('-o slab_chunk_max=4096');
     ok($s2, "started the server");
     my $m2 = MC::Client->new($s2);
     # Specifically trying to cross the chunk boundary when internally
@@ -135,11 +135,6 @@ $empty->('y');
         my (undef, $gval, undef) = $m2->get('t');
         ok($gval eq $val, $gval . " = " . $val);
     }
-
-    my $cval = ('d' x 8100) . '123';
-
-    my $m3 = $s2->new_sock;
-    mem_get_is($m3, 't', $cval, "large value set from bin fetched from ascii");
 }
 
 {
@@ -441,14 +436,7 @@ $mc->silent_mutation(::CMD_ADDQ, 'silentadd', 'silentaddval');
     my %stats = $mc->stats('settings');
 
     is(1024, $stats{'maxconns'});
-    # we run SSL tests over TCP; hence the domain_socket
-    # is expected to be NULL.
-    if (enabled_tls_testing()) {
-        is('NULL', $stats{'domain_socket'});
-    } else {
-        isnt('NULL', $stats{'domain_socket'});
-    }
-
+    is('NULL', $stats{'domain_socket'});
     is('on', $stats{'evictions'});
     is('yes', $stats{'cas_enabled'});
     is('yes', $stats{'flush_enabled'});
@@ -491,14 +479,14 @@ $mc->silent_mutation(::CMD_ADDQ, 'silentadd', 'silentaddval');
         $data .= $mc->build_command(::CMD_SETQ, "alt_$k", "blah", 0, $extra, 0);
         if (length($data) > 2024) {
             for (my $j = 2024; $j < min(2096, length($data)); $j++) {
-                $mc->{socket}->syswrite(substr($data, 0, $j));
+                $mc->{socket}->send(substr($data, 0, $j));
                 $mc->flush_socket;
                 sleep(0.001);
-                $mc->{socket}->syswrite(substr($data, $j));
+                $mc->{socket}->send(substr($data, $j));
                 $mc->flush_socket;
             }
         } else {
-            $mc->{socket}->syswrite($data);
+            $mc->{socket}->send($data);
         }
         $mc->flush_socket;
         $check->($k, 82, $v);
@@ -520,8 +508,6 @@ my %stats = $mc->stats('detail dump');
     };
     ok($@->einval, "Invalid key length");
 }
-
-done_testing();
 
 # ######################################################################
 # Test ends around here.
@@ -578,18 +564,9 @@ sub send_command {
 
     my $full_msg = $self->build_command($cmd, $key, $val, $opaque, $extra_header, $cas);
 
-    my $sent = 0;
-    my $data_len =  length($full_msg);
-    while ($sent < $data_len) {
-        my $sent_bytes = $self->{socket}->syswrite($full_msg,
-                                    $data_len - $sent > MemcachedTest::MAX_READ_WRITE_SIZE ?
-                                        MemcachedTest::MAX_READ_WRITE_SIZE : ($data_len - $sent),
-                                    $sent);
-        last if ($sent_bytes <= 0);
-        $sent += $sent_bytes;
-    }
-    die("Send failed:  $!") unless $data_len;
-    if($sent != $data_len) {
+    my $sent = $self->{socket}->send($full_msg);
+    die("Send failed:  $!") unless $sent;
+    if($sent != length($full_msg)) {
         die("only sent $sent of " . length($full_msg) . " bytes");
     }
 }
@@ -628,7 +605,7 @@ sub _handle_single_response {
 
     my $hdr = "";
     while(::MIN_RECV_BYTES - length($hdr) > 0) {
-        $self->{socket}->sysread(my $response, ::MIN_RECV_BYTES - length($hdr));
+        $self->{socket}->recv(my $response, ::MIN_RECV_BYTES - length($hdr));
         $hdr .= $response;
     }
     Test::More::is(length($hdr), ::MIN_RECV_BYTES, "Expected read length");
@@ -644,7 +621,7 @@ sub _handle_single_response {
     # fetch the value
     my $rv="";
     while($remaining - length($rv) > 0) {
-        $self->{socket}->sysread(my $buf, $remaining - length($rv));
+        $self->{socket}->recv(my $buf, $remaining - length($rv));
         $rv .= $buf;
     }
     if(length($rv) != $remaining) {

@@ -82,15 +82,6 @@ fi
 AM_PROG_CC_C_O
 AC_PROG_INSTALL
 
-AC_ARG_ENABLE(arm_crc32,
-  [AS_HELP_STRING([--enable-arm-crc32], [Enable ARMv8 CRC32 instructions])])
-
-AC_ARG_ENABLE(extstore,
-  [AS_HELP_STRING([--disable-extstore], [Disable external storage (extstore)])])
-
-AC_ARG_ENABLE(seccomp,
-  [AS_HELP_STRING([--enable-seccomp],[Enable seccomp restrictions EXPERIMENTAL])])
-
 AC_ARG_ENABLE(sasl,
   [AS_HELP_STRING([--enable-sasl],[Enable SASL authentication])])
 
@@ -100,12 +91,7 @@ AC_ARG_ENABLE(sasl_pwdb,
 AS_IF([test "x$enable_sasl_pwdb" = "xyes"],
       [enable_sasl=yes ])
 
-AC_ARG_ENABLE(tls,
-  [AS_HELP_STRING([--enable-tls], [Enable Transport Layer Security EXPERIMENTAL ])])
 
-
-AC_ARG_ENABLE(asan,
-  [AS_HELP_STRING([--enable-asan], [Compile with ASAN EXPERIMENTAL ])])
 
 dnl **********************************************************************
 dnl DETECT_SASL_CB_GETCONF
@@ -130,33 +116,9 @@ unsigned long val = SASL_CB_GETCONF;
                      [Set to nonzero if your SASL implementation supports SASL_CB_GETCONF])])
 ])
 
-dnl **********************************************************************
-dnl DETECT_SASL_CB_GETCONFPATH
-dnl
-dnl check if we can use SASL_CB_GETCONFPATH
-dnl **********************************************************************
-AC_DEFUN([AC_C_DETECT_SASL_CB_GETCONFPATH],
-[
-    AC_CACHE_CHECK([for SASL_CB_GETCONFPATH],
-        [ac_cv_c_sasl_cb_getconfpath],
-        [AC_TRY_COMPILE(
-            [
-#include <sasl/sasl.h>
-            ], [
-unsigned long val = SASL_CB_GETCONFPATH;
-            ],
-            [ ac_cv_c_sasl_cb_getconfpath=yes ],
-            [ ac_cv_c_sasl_cb_getconfpath=no ])
-        ])
-    AS_IF([test "$ac_cv_c_sasl_cb_getconfpath" = "yes"],
-          [AC_DEFINE([HAVE_SASL_CB_GETCONFPATH], 1,
-                     [Set to nonzero if your SASL implementation supports SASL_CB_GETCONFPATH])])
-])
-
 AC_CHECK_HEADERS([sasl/sasl.h])
 if test "x$enable_sasl" = "xyes"; then
   AC_C_DETECT_SASL_CB_GETCONF
-  AC_C_DETECT_SASL_CB_GETCONFPATH
   AC_DEFINE([ENABLE_SASL],1,[Set to nonzero if you want to include SASL])
   AC_SEARCH_LIBS([sasl_server_init], [sasl2 sasl], [],
     [
@@ -175,11 +137,12 @@ if test "x$enable_dtrace" = "xyes"; then
   if test "x$DTRACE" != "xno"; then
     AC_DEFINE([ENABLE_DTRACE],1,[Set to nonzero if you want to include DTRACE])
     build_dtrace=yes
-    $DTRACE -h -o conftest.h -s memcached_dtrace.d 2>/dev/zero
+    # DTrace on MacOSX does not use -G option
+    $DTRACE -G -o conftest.$$ -s memcached_dtrace.d 2>/dev/zero
     if test $? -eq 0
     then
         dtrace_instrument_obj=yes
-        rm conftest.h
+        rm conftest.$$
     fi
 
     if test "`which tr`" = "/usr/ucb/tr"; then
@@ -190,30 +153,9 @@ if test "x$enable_dtrace" = "xyes"; then
   fi
 fi
 
-if test "x$enable_extstore" != "xno"; then
-    AC_DEFINE([EXTSTORE],1,[Set to nonzero if you want to enable extstore])
-fi
-
-if test "x$enable_tls" = "xyes"; then
-    AC_DEFINE([TLS],1,[Set to nonzero if you want to enable TLS])
-fi
-
-if test "x$enable_arm_crc32" = "xyes"; then
-    AC_DEFINE([ARM_CRC32],1,[Set to nonzero if you want to enable ARMv8 crc32])
-fi
-
-if test "x$enable_asan" = "xyes"; then
-    AC_DEFINE([ASAN],1,[Set to nonzero if you want to compile using ASAN])
-fi
-
 AM_CONDITIONAL([BUILD_DTRACE],[test "$build_dtrace" = "yes"])
 AM_CONDITIONAL([DTRACE_INSTRUMENT_OBJ],[test "$dtrace_instrument_obj" = "yes"])
 AM_CONDITIONAL([ENABLE_SASL],[test "$enable_sasl" = "yes"])
-AM_CONDITIONAL([ENABLE_EXTSTORE],[test "$enable_extstore" != "no"])
-AM_CONDITIONAL([ENABLE_ARM_CRC32],[test "$enable_arm_crc32" = "yes"])
-AM_CONDITIONAL([ENABLE_TLS],[test "$enable_tls" = "yes"])
-AM_CONDITIONAL([ENABLE_ASAN],[test "$enable_asan" = "yes"])
-
 
 AC_SUBST(DTRACE)
 AC_SUBST(DTRACEFLAGS)
@@ -229,7 +171,7 @@ if test "x$enable_coverage" != "xno"; then
       CFLAGS="$CFLAGS -pthread"
       AC_PATH_PROG([PROFILER], [gcov], "no", [$PATH])
       if test "x$PROFILER" != "xno"; then
-         # Issue 97: The existence of gcov doesn't mean we have -lgcov
+         # Issue 97: The existense of gcov doesn't mean we have -lgcov
          AC_CHECK_LIB(gcov, main,
                     [
                       PROFILER_FLAGS="-fprofile-arcs -ftest-coverage"
@@ -271,15 +213,9 @@ return sizeof(void*) == 8 ? 0 : 1;
     ],[
       CFLAGS="-m64 $org_cflags"
     ],[
-      AC_MSG_ERROR([Don't know how to build a 64-bit object.])
-    ],[
-       dnl cross compile
-       AC_MSG_WARN([Assuming no extra CFLAGS are required for cross-compiling 64bit version.])
+    AC_MSG_ERROR([Don't know how to build a 64-bit object.])
     ])
 fi
-
-dnl Check if data pointer is 64bit or not
-AC_CHECK_SIZEOF([void *])
 
 # Issue 213: Search for clock_gettime to help people linking
 #            with a static version of libevent
@@ -302,7 +238,7 @@ AC_ARG_WITH(libevent,
 dnl ------------------------------------------------------
 dnl libevent detection.  swiped from Tor.  modified a bit.
 
-LIBEVENT_URL=https://www.monkey.org/~provos/libevent/
+LIBEVENT_URL=http://www.monkey.org/~provos/libevent/
 
 AC_CACHE_CHECK([for libevent directory], ac_cv_libevent_dir, [
   saved_LIBS="$LIBS"
@@ -375,97 +311,9 @@ if test $ac_cv_libevent_dir != "(system)"; then
   fi
 fi
 
-trylibssldir=""
-AC_ARG_WITH(libssl,
-       [  --with-libssl=PATH     Specify path to libssl installation ],
-       [
-                if test "x$withval" != "xno" ; then
-                        trylibssldir=$withval
-                fi
-       ]
-)
-
-dnl ----------------------------------------------------------------------------
-dnl libssl detection.  swiped from libevent.  modified for openssl detection.
-
-OPENSSL_URL=https://www.openssl.org/
-if test "x$enable_tls" = "xyes"; then
-  AC_CACHE_CHECK([for libssl directory], ac_cv_libssl_dir, [
-    saved_LIBS="$LIBS"
-    saved_LDFLAGS="$LDFLAGS"
-    saved_CPPFLAGS="$CPPFLAGS"
-    le_found=no
-    for ledir in $trylibssldir "" $prefix /usr/local ; do
-      LDFLAGS="$saved_LDFLAGS"
-      LIBS="-lssl -lcrypto $saved_LIBS"
-
-      # Skip the directory if it isn't there.
-      if test ! -z "$ledir" -a ! -d "$ledir" ; then
-         continue;
-      fi
-      if test ! -z "$ledir" ; then
-        if test -d "$ledir/lib" ; then
-          LDFLAGS="-L$ledir/lib $LDFLAGS"
-        else
-          LDFLAGS="-L$ledir $LDFLAGS"
-        fi
-        if test -d "$ledir/include" ; then
-          CPPFLAGS="-I$ledir/include $CPPFLAGS"
-        else
-          CPPFLAGS="-I$ledir $CPPFLAGS"
-        fi
-      fi
-      # Can I compile and link it?
-      AC_TRY_LINK([#include <sys/time.h>
-  #include <sys/types.h>
-  #include <assert.h>
-  #include <openssl/ssl.h>], [ SSL_CTX* ssl_ctx = SSL_CTX_new(TLS_server_method());
-                              assert(OPENSSL_VERSION_NUMBER >= 0x10100000L);],
-         [ libssl_linked=yes ], [ libssl_linked=no ])
-      if test $libssl_linked = yes; then
-         if test ! -z "$ledir" ; then
-           ac_cv_libssl_dir=$ledir
-           _myos=`echo $target_os | cut -f 1 -d .`
-           AS_IF(test "$SUNCC" = "yes" -o "x$_myos" = "xsolaris2",
-                 [saved_LDFLAGS="$saved_LDFLAGS -Wl,-R$ledir/lib"],
-                 [AS_IF(test "$GCC" = "yes",
-                       [saved_LDFLAGS="$saved_LDFLAGS -Wl,-rpath,$ledir/lib"])])
-         else
-           ac_cv_libssl_dir="(system)"
-         fi
-         le_found=yes
-         break
-      fi
-    done
-    LIBS="$saved_LIBS"
-    LDFLAGS="$saved_LDFLAGS"
-    CPPFLAGS="$saved_CPPFLAGS"
-    if test $le_found = no ; then
-      AC_MSG_ERROR([libssl (at least version 1.1.0) is required.  You can get it from $OPENSSL_URL
-
-        If it's already installed, specify its path using --with-libssl=/dir/
-  ])
-    fi
-  ])
-  LIBS="-lssl -lcrypto $LIBS"
-  if test $ac_cv_libssl_dir != "(system)"; then
-    if test -d "$ac_cv_libssl_dir/lib" ; then
-      LDFLAGS="-L$ac_cv_libssl_dir/lib $LDFLAGS"
-      le_libdir="$ac_cv_libssl_dir/lib"
-    else
-      LDFLAGS="-L$ac_cv_libssl_dir $LDFLAGS"
-      le_libdir="$ac_cv_libssl_dir"
-    fi
-    if test -d "$ac_cv_libssl_dir/include" ; then
-      CPPFLAGS="-I$ac_cv_libssl_dir/include $CPPFLAGS"
-    else
-      CPPFLAGS="-I$ac_cv_libssl_dir $CPPFLAGS"
-    fi
-  fi
-fi
-
 dnl ----------------------------------------------------------------------------
 
+AC_SEARCH_LIBS(umem_cache_create, umem)
 AC_SEARCH_LIBS(gethugepagesizes, hugetlbfs)
 
 AC_HEADER_STDBOOL
@@ -568,10 +416,30 @@ fi
 AC_C_SOCKLEN_T
 
 dnl Check if we're a little-endian or a big-endian system, needed by hash code
-AC_C_BIGENDIAN(
-  [AC_DEFINE(ENDIAN_BIG, 1, [machine is bigendian])],
-  [AC_DEFINE(ENDIAN_LITTLE, 1, [machine is littleendian])],
-  [AC_MSG_ERROR([Cannot detect endianness. Must pass ac_cv_c_bigendian={yes,no} to configure.])])
+AC_DEFUN([AC_C_ENDIAN],
+[AC_CACHE_CHECK(for endianness, ac_cv_c_endian,
+[
+  AC_RUN_IFELSE(
+    [AC_LANG_PROGRAM([], [dnl
+        long val = 1;
+        char *c = (char *) &val;
+        exit(*c == 1);
+    ])
+  ],[
+    ac_cv_c_endian=big
+  ],[
+    ac_cv_c_endian=little
+  ])
+])
+if test $ac_cv_c_endian = big; then
+  AC_DEFINE(ENDIAN_BIG, 1, [machine is bigendian])
+fi
+if test $ac_cv_c_endian = little; then
+  AC_DEFINE(ENDIAN_LITTLE, 1, [machine is littleendian])
+fi
+])
+
+AC_C_ENDIAN
 
 AC_DEFUN([AC_C_HTONLL],
 [
@@ -605,15 +473,11 @@ fi
 
 AC_CHECK_FUNCS(mlockall)
 AC_CHECK_FUNCS(getpagesizes)
-AC_CHECK_FUNCS(sysconf)
 AC_CHECK_FUNCS(memcntl)
 AC_CHECK_FUNCS(sigignore)
 AC_CHECK_FUNCS(clock_gettime)
 AC_CHECK_FUNCS([accept4], [AC_DEFINE(HAVE_ACCEPT4, 1, [Define to 1 if support accept4])])
-AC_CHECK_FUNCS([getopt_long], [AC_DEFINE(HAVE_GETOPT_LONG, 1, [Define to 1 if support getopt_long])])
 
-dnl Need to disable opt for alignment check. GCC is too clever and turns this
-dnl into wide stores and no cmp under O2.
 AC_DEFUN([AC_C_ALIGNMENT],
 [AC_CACHE_CHECK(for alignment, ac_cv_c_alignment,
 [
@@ -621,7 +485,6 @@ AC_DEFUN([AC_C_ALIGNMENT],
     [AC_LANG_PROGRAM([
 #include <stdlib.h>
 #include <inttypes.h>
-#pragma GCC optimize ("O0")
     ], [
        char *buf = malloc(32);
 
@@ -648,15 +511,12 @@ AC_DEFUN([AC_C_ALIGNMENT],
   ],[
     ac_cv_c_alignment=need
   ],[
-    dnl cross compile
-    ac_cv_c_alignment=maybe
+    ac_cv_c_alignment=need
   ])
 ])
-AS_IF([test $ac_cv_c_alignment = need],
-  [AC_DEFINE(NEED_ALIGN, 1, [Machine need alignment])])
-AS_IF([test $ac_cv_c_alignment = maybe],
-  [AC_MSG_WARN([Assuming aligned access is required when cross-compiling])
-   AC_DEFINE(NEED_ALIGN, 1, [Machine need alignment])])
+if test $ac_cv_c_alignment = need; then
+  AC_DEFINE(NEED_ALIGN, 1, [Machine need alignment])
+fi
 ])
 
 AC_C_ALIGNMENT
@@ -679,8 +539,7 @@ dnl Check for usage of 64bit atomics
 dnl 32bit systems shouldn't have these.
 have_gcc_64atomics=no
 AC_MSG_CHECKING(for GCC 64bit atomics)
-AC_TRY_LINK([#include <inttypes.h>
-   ],[
+AC_TRY_LINK([],[
   uint64_t a;
   uint64_t b;
   b = __sync_add_and_fetch(&a, 1);
@@ -703,38 +562,15 @@ AC_CHECK_FUNCS(setppriv, [
    ], [])
 ],[])
 
-AS_IF([test "x$enable_seccomp" = "xyes" ], [
-   AC_CHECK_LIB(seccomp, seccomp_rule_add, [
-      AC_DEFINE([HAVE_DROP_PRIVILEGES], 1,
-         [Define this if you have an implementation of drop_privileges()])
-      build_linux_privs=yes
-      AC_DEFINE([HAVE_DROP_WORKER_PRIVILEGES], 1,
-         [Define this if you have an implementation of drop_worker_privileges()])
-      build_linux_privs=yes
-   ], [])
-])
-
-AC_CHECK_FUNCS(pledge, [
-   AC_CHECK_HEADER(unistd.h, [
-      AC_DEFINE([HAVE_DROP_PRIVILEGES], 1,
-         [Define this if you have an implementation of drop_privileges()])
-      build_openbsd_privs=yes
-   ], [])
-],[])
-
-AC_CHECK_FUNCS(cap_enter, [
-   AC_CHECK_HEADER(sys/capsicum.h, [
-      AC_DEFINE([HAVE_DROP_PRIVILEGES], 1,
-         [Define this if you have an implementation of drop_privileges()])
-      build_freebsd_privs=yes
-   ], [])
-],[])
-
-
 AM_CONDITIONAL([BUILD_SOLARIS_PRIVS],[test "$build_solaris_privs" = "yes"])
-AM_CONDITIONAL([BUILD_LINUX_PRIVS],[test "$build_linux_privs" = "yes"])
-AM_CONDITIONAL([BUILD_OPENBSD_PRIVS],[test "$build_openbsd_privs" = "yes"])
-AM_CONDITIONAL([BUILD_FREEBSD_PRIVS],[test "$build_freebsd_privs" = "yes"])
+
+AC_CHECK_HEADER(umem.h, [
+   AC_DEFINE([HAVE_UMEM_H], 1,
+         [Define this if you have umem.h])
+   build_cache=no
+], [build_cache=yes])
+
+AM_CONDITIONAL([BUILD_CACHE], [test "x$build_cache" = "xyes"])
 
 AC_ARG_ENABLE(docs,
   [AS_HELP_STRING([--disable-docs],[Disable documentation generation])])
@@ -759,9 +595,6 @@ elif test "$GCC" = "yes"
 then
   GCC_VERSION=`$CC -dumpversion`
   CFLAGS="$CFLAGS -Wall -Werror -pedantic -Wmissing-prototypes -Wmissing-declarations -Wredundant-decls"
-  if test "x$enable_asan" = "xyes"; then
-    CFLAGS="$CFLAGS -fsanitize=address"
-  fi
   case $GCC_VERSION in
     4.4.*)
     CFLAGS="$CFLAGS -fno-strict-aliasing"

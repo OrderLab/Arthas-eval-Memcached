@@ -10,35 +10,18 @@
 #define LOGGER_ENTRY_MAX_SIZE 2048
 #define GET_LOGGER() ((logger *) pthread_getspecific(logger_key));
 
-/* Inlined from memcached.h - should go into sub header */
-typedef unsigned int rel_time_t;
-
 enum log_entry_type {
     LOGGER_ASCII_CMD = 0,
     LOGGER_EVICTION,
     LOGGER_ITEM_GET,
-    LOGGER_ITEM_STORE,
-    LOGGER_CRAWLER_STATUS,
-    LOGGER_SLAB_MOVE,
-#ifdef EXTSTORE
-    LOGGER_EXTSTORE_WRITE,
-    LOGGER_COMPACT_START,
-    LOGGER_COMPACT_ABORT,
-    LOGGER_COMPACT_READ_START,
-    LOGGER_COMPACT_READ_END,
-    LOGGER_COMPACT_END,
-    LOGGER_COMPACT_FRAGINFO,
-#endif
+    LOGGER_ITEM_STORE
 };
 
 enum log_entry_subtype {
     LOGGER_TEXT_ENTRY = 0,
     LOGGER_EVICTION_ENTRY,
     LOGGER_ITEM_GET_ENTRY,
-    LOGGER_ITEM_STORE_ENTRY,
-#ifdef EXTSTORE
-    LOGGER_EXT_WRITE_ENTRY,
-#endif
+    LOGGER_ITEM_STORE_ENTRY
 };
 
 enum logger_ret_type {
@@ -66,51 +49,32 @@ struct logentry_eviction {
     uint32_t latime;
     uint16_t it_flags;
     uint8_t nkey;
-    uint8_t clsid;
     char key[];
 };
-#ifdef EXTSTORE
-struct logentry_ext_write {
-    long long int exptime;
-    uint32_t latime;
-    uint16_t it_flags;
-    uint8_t nkey;
-    uint8_t clsid;
-    uint8_t bucket;
-    char key[];
-};
-#endif
+
 struct logentry_item_get {
     uint8_t was_found;
     uint8_t nkey;
-    uint8_t clsid;
-    int sfd;
     char key[];
 };
 
 struct logentry_item_store {
     int status;
     int cmd;
-    rel_time_t ttl;
     uint8_t nkey;
-    uint8_t clsid;
-    int sfd;
     char key[];
 };
 
 /* end intermediary structures */
 
-/* WARNING: cuddled items aren't compatible with warm restart. more code
- * necessary to ensure log streams are all flushed/processed before stopping
- */
 typedef struct _logentry {
     enum log_entry_subtype event;
-    uint8_t pad;
     uint16_t eflags;
     uint64_t gid;
     struct timeval tv; /* not monotonic! */
     int size;
     union {
+        void *entry; /* probably an item */
         char end;
     } data[];
 } logentry;
@@ -120,7 +84,7 @@ typedef struct _logentry {
 #define LOG_MUTATIONS  (1<<3) /* set/append/incr/etc */
 #define LOG_SYSERRORS  (1<<4) /* malloc/etc errors */
 #define LOG_CONNEVENTS (1<<5) /* new client, closed, etc */
-#define LOG_EVICTIONS  (1<<6) /* details of evicted items */
+#define LOG_EVICTIONS  (1<<6) /* defailts of evicted items */
 #define LOG_STRICT     (1<<7) /* block worker instead of drop */
 #define LOG_RAWCMDS    (1<<9) /* raw ascii commands */
 
@@ -167,7 +131,6 @@ extern pthread_key_t logger_key;
 /* public functions */
 
 void logger_init(void);
-void logger_stop(void);
 logger *logger_create(void);
 
 #define LOGGER_LOG(l, flag, type, ...) \
@@ -188,9 +151,5 @@ enum logger_add_watcher_ret {
 };
 
 enum logger_add_watcher_ret logger_add_watcher(void *c, const int sfd, uint16_t f);
-
-/* functions used by restart system */
-uint64_t logger_get_gid(void);
-void logger_set_gid(uint64_t gid);
 
 #endif
