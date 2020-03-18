@@ -17,78 +17,51 @@
 #include <netdb.h>
 #include <pthread.h>
 #include <unistd.h>
-#include <assert.h>
-#include <grp.h>
-#include <signal.h>
-/* need this to get IOV_MAX on some platforms. */
-#ifndef __need_IOV_MAX
-#define __need_IOV_MAX
-#endif
-#include <limits.h>
-/* FreeBSD 4.x doesn't have IOV_MAX exposed. */
-#ifndef IOV_MAX
-#if defined(__FreeBSD__) || defined(__APPLE__) || defined(__GNU__)
-# define IOV_MAX 1024
-/* GNU/Hurd don't set MAXPATHLEN
- * http://www.gnu.org/software/hurd/hurd/porting/guidelines.html#PATH_MAX_tt_MAX_PATH_tt_MAXPATHL */
-#ifndef MAXPATHLEN
-#define MAXPATHLEN 4096
-#endif
-#endif
-#endif
 
-#include "itoa_ljust.h"
 #include "protocol_binary.h"
 #include "cache.h"
-#include "logger.h"
-
-#ifdef EXTSTORE
-#include "extstore.h"
-#include "crc32c.h"
-#endif
 
 #include "sasl_defs.h"
-#ifdef TLS
-#include <openssl/ssl.h>
-#endif
 
 /** Maximum length of a key. */
 #define KEY_MAX_LENGTH 250
 
-/** Maximum length of a uri encoded key. */
-#define KEY_MAX_URI_ENCODED_LENGTH (KEY_MAX_LENGTH  * 3 + 1)
-
 /** Size of an incr buf. */
 #define INCR_MAX_STORAGE_LEN 24
 
-#define WRITE_BUFFER_SIZE 1024
-#define READ_BUFFER_SIZE 16384
-#define READ_BUFFER_CACHED 0
+#define DATA_BUFFER_SIZE 2048
 #define UDP_READ_BUFFER_SIZE 65536
 #define UDP_MAX_PAYLOAD_SIZE 1400
 #define UDP_HEADER_SIZE 8
 #define MAX_SENDBUF_SIZE (256 * 1024 * 1024)
+/* I'm told the max length of a 64-bit num converted to string is 20 bytes.
+ * Plus a few for spaces, \r\n, \0 */
+#define SUFFIX_SIZE 24
+
+/** Initial size of list of items being returned by "get". */
+#define ITEM_LIST_INITIAL 200
+
+/** Initial size of list of CAS suffixes appended to "gets" lines. */
+#define SUFFIX_LIST_INITIAL 20
+
+/** Initial size of the sendmsg() scatter/gather array. */
+#define IOV_LIST_INITIAL 400
+
+/** Initial number of sendmsg() argument structures to allocate. */
+#define MSG_LIST_INITIAL 10
+
+/** High water marks for buffer shrinking */
+#define READ_BUFFER_HIGHWAT 8192
+#define ITEM_LIST_HIGHWAT 400
+#define IOV_LIST_HIGHWAT 600
+#define MSG_LIST_HIGHWAT 100
 
 /* Binary protocol stuff */
-#define BIN_MAX_EXTLEN 20 // length of the _incr command is currently the longest.
+#define MIN_BIN_PKT_LENGTH 16
+#define BIN_PKT_HDR_WORDS (MIN_BIN_PKT_LENGTH/sizeof(uint32_t))
 
 /* Initial power multiplier for the hash table */
 #define HASHPOWER_DEFAULT 16
-#define HASHPOWER_MAX 32
-
-/*
- * We only reposition items in the LRU queue if they haven't been repositioned
- * in this many seconds. That saves us from churning on frequently-accessed
- * items.
- */
-#define ITEM_UPDATE_INTERVAL 60
-
-/*
- * Valid range of the maximum size of an item, in bytes.
- */
-#define ITEM_SIZE_MAX_LOWER_LIMIT 1024
-#define ITEM_SIZE_MAX_UPPER_LIMIT 1024 * 1024 * 1024
-
 
 /* unistd.h is here */
 #if HAVE_UNISTD_H
@@ -97,15 +70,14 @@
 
 /* Slab sizing definitions. */
 #define POWER_SMALLEST 1
-#define POWER_LARGEST  256 /* actual cap is 255 */
-#define SLAB_GLOBAL_PAGE_POOL 0 /* magic slab class for storing pages for reassignment */
+#define POWER_LARGEST  200
 #define CHUNK_ALIGN_BYTES 8
-/* slab class max is a 6-bit number, -1. */
-#define MAX_NUMBER_OF_SLAB_CLASSES (63 + 1)
+#define DONT_PREALLOC_SLABS
+#define MAX_NUMBER_OF_SLAB_CLASSES (POWER_LARGEST + 1)
 
 /** How long an object can reasonably be assumed to be locked before
-    harvesting it on a low memory condition. Default: disabled. */
-#define TAIL_REPAIR_TIME_DEFAULT 0
+    harvesting it on a low memory condition. */
+#define TAIL_REPAIR_TIME (3 * 3600)
 
 /* warning: don't use these macros with a function, as it evals its arg twice */
 #define ITEM_get_cas(i) (((i)->it_flags & ITEM_CAS) ? \
@@ -124,16 +96,12 @@
          + (((item)->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0))
 
 #define ITEM_data(item) ((char*) &((item)->data) + (item)->nkey + 1 \
-         + (((item)->it_flags & ITEM_CFLAGS) ? sizeof(uint32_t) : 0) \
+         + (item)->nsuffix \
          + (((item)->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0))
 
 #define ITEM_ntotal(item) (sizeof(struct _stritem) + (item)->nkey + 1 \
-         + (item)->nbytes \
-         + (((item)->it_flags & ITEM_CFLAGS) ? sizeof(uint32_t) : 0) \
+         + (item)->nsuffix + (item)->nbytes \
          + (((item)->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0))
-
-#define ITEM_clsid(item) ((item)->slabs_clsid & ~(3<<6))
-#define ITEM_lruid(item) ((item)->slabs_clsid & (3<<6))
 
 #define STAT_KEY_LEN 128
 #define STAT_VAL_LEN 128
@@ -152,17 +120,6 @@
 /** Common APPEND_NUM_FMT_STAT format. */
 #define APPEND_NUM_STAT(num, name, fmt, val) \
     APPEND_NUM_FMT_STAT("%d:%s", num, name, fmt, val)
-
-/** Item client flag conversion */
-#define FLAGS_CONV(it, flag) { \
-    if ((it)->it_flags & ITEM_CFLAGS) { \
-        flag = *((uint32_t *)ITEM_suffix((it))); \
-    } else { \
-        flag = 0; \
-    } \
-}
-
-#define FLAGS_SIZE(item) (((item)->it_flags & ITEM_CFLAGS) ? sizeof(uint32_t) : 0)
 
 /**
  * Callback for any function producing stats.
@@ -194,8 +151,6 @@ enum conn_states {
     conn_swallow,    /**< swallowing unnecessary bytes w/o storing */
     conn_closing,    /**< closing this connection */
     conn_mwrite,     /**< writing out many items sequentially */
-    conn_closed,     /**< connection is closed */
-    conn_watch,      /**< held by the logger thread as a watcher */
     conn_max_state   /**< Max state value (used for assertion) */
 };
 
@@ -226,14 +181,6 @@ enum network_transport {
     udp_transport
 };
 
-enum pause_thread_types {
-    PAUSE_WORKER_THREADS = 0,
-    PAUSE_ALL_THREADS,
-    RESUME_ALL_THREADS,
-    RESUME_WORKER_THREADS
-};
-
-#define IS_TCP(x) (x == tcp_transport)
 #define IS_UDP(x) (x == udp_transport)
 
 #define NREAD_ADD 1
@@ -244,7 +191,7 @@ enum pause_thread_types {
 #define NREAD_CAS 6
 
 enum store_item_type {
-    NOT_STORED=0, STORED, EXISTS, NOT_FOUND, TOO_LARGE, NO_MEMORY
+    NOT_STORED=0, STORED, EXISTS, NOT_FOUND
 };
 
 enum delta_result_type {
@@ -252,132 +199,74 @@ enum delta_result_type {
 };
 
 /** Time relative to server start. Smaller than time_t on 64-bit systems. */
-// TODO: Move to sub-header. needed in logger.h
-//typedef unsigned int rel_time_t;
-
-/** Use X macros to avoid iterating over the stats fields during reset and
- * aggregation. No longer have to add new stats in 3+ places.
- */
-
-#define SLAB_STATS_FIELDS \
-    X(set_cmds) \
-    X(get_hits) \
-    X(touch_hits) \
-    X(delete_hits) \
-    X(cas_hits) \
-    X(cas_badval) \
-    X(incr_hits) \
-    X(decr_hits)
+typedef unsigned int rel_time_t;
 
 /** Stats stored per slab (and per thread). */
 struct slab_stats {
-#define X(name) uint64_t    name;
-    SLAB_STATS_FIELDS
-#undef X
+    uint64_t  set_cmds;
+    uint64_t  get_hits;
+    uint64_t  touch_hits;
+    uint64_t  delete_hits;
+    uint64_t  cas_hits;
+    uint64_t  cas_badval;
+    uint64_t  incr_hits;
+    uint64_t  decr_hits;
 };
-
-#define THREAD_STATS_FIELDS \
-    X(get_cmds) \
-    X(get_misses) \
-    X(get_expired) \
-    X(get_flushed) \
-    X(touch_cmds) \
-    X(touch_misses) \
-    X(delete_misses) \
-    X(incr_misses) \
-    X(decr_misses) \
-    X(cas_misses) \
-    X(meta_cmds) \
-    X(bytes_read) \
-    X(bytes_written) \
-    X(flush_cmds) \
-    X(conn_yields) /* # of yields for connections (-R option)*/ \
-    X(auth_cmds) \
-    X(auth_errors) \
-    X(idle_kicks) /* idle connections killed */ \
-    X(response_obj_oom) \
-    X(read_buf_oom)
-
-#ifdef EXTSTORE
-#define EXTSTORE_THREAD_STATS_FIELDS \
-    X(get_extstore) \
-    X(get_aborted_extstore) \
-    X(get_oom_extstore) \
-    X(recache_from_extstore) \
-    X(miss_from_extstore) \
-    X(badcrc_from_extstore)
-#endif
 
 /**
  * Stats stored per-thread.
  */
 struct thread_stats {
     pthread_mutex_t   mutex;
-#define X(name) uint64_t    name;
-    THREAD_STATS_FIELDS
-#ifdef EXTSTORE
-    EXTSTORE_THREAD_STATS_FIELDS
-#endif
-#undef X
+    uint64_t          get_cmds;
+    uint64_t          get_misses;
+    uint64_t          touch_cmds;
+    uint64_t          touch_misses;
+    uint64_t          delete_misses;
+    uint64_t          incr_misses;
+    uint64_t          decr_misses;
+    uint64_t          cas_misses;
+    uint64_t          bytes_read;
+    uint64_t          bytes_written;
+    uint64_t          flush_cmds;
+    uint64_t          conn_yields; /* # of yields for connections (-R option)*/
+    uint64_t          auth_cmds;
+    uint64_t          auth_errors;
     struct slab_stats slab_stats[MAX_NUMBER_OF_SLAB_CLASSES];
-    uint64_t lru_hits[POWER_LARGEST];
-    uint64_t response_obj_bytes;
-    uint64_t response_obj_total;
-    uint64_t response_obj_free;
-    uint64_t read_buf_bytes;
-    uint64_t read_buf_bytes_free;
 };
 
 /**
- * Global stats. Only resettable stats should go into this structure.
+ * Global stats.
  */
 struct stats {
-    uint64_t      total_items;
-    uint64_t      total_conns;
-    uint64_t      rejected_conns;
-    uint64_t      malloc_fails;
-    uint64_t      listen_disabled_num;
-    uint64_t      slabs_moved;       /* times slabs were moved around */
-    uint64_t      slab_reassign_rescues; /* items rescued during slab move */
-    uint64_t      slab_reassign_evictions_nomem; /* valid items lost during slab move */
-    uint64_t      slab_reassign_inline_reclaim; /* valid items lost during slab move */
-    uint64_t      slab_reassign_chunk_rescues; /* chunked-item chunks recovered */
-    uint64_t      slab_reassign_busy_items; /* valid temporarily unmovable */
-    uint64_t      slab_reassign_busy_deletes; /* refcounted items killed */
-    uint64_t      lru_crawler_starts; /* Number of item crawlers kicked off */
-    uint64_t      lru_maintainer_juggles; /* number of LRU bg pokes */
-    uint64_t      time_in_listen_disabled_us;  /* elapsed time in microseconds while server unable to process new connections */
-    uint64_t      log_worker_dropped; /* logs dropped by worker threads */
-    uint64_t      log_worker_written; /* logs written by worker threads */
-    uint64_t      log_watcher_skipped; /* logs watchers missed */
-    uint64_t      log_watcher_sent; /* logs sent to watcher buffers */
-#ifdef EXTSTORE
-    uint64_t      extstore_compact_lost; /* items lost because they were locked */
-    uint64_t      extstore_compact_rescues; /* items re-written during compaction */
-    uint64_t      extstore_compact_skipped; /* unhit items skipped during compaction */
-#endif
-#ifdef TLS
-    uint64_t      ssl_handshake_errors; /* TLS failures at accept/handshake time */
-#endif
-    struct timeval maxconns_entered;  /* last time maxconns entered */
-};
-
-/**
- * Global "state" stats. Reflects state that shouldn't be wiped ever.
- * Ordered for some cache line locality for commonly updated counters.
- */
-struct stats_state {
-    uint64_t      curr_items;
+    pthread_mutex_t mutex;
+    unsigned int  curr_items;
+    unsigned int  total_items;
     uint64_t      curr_bytes;
-    uint64_t      curr_conns;
-    uint64_t      hash_bytes;       /* size used for hash tables */
-    unsigned int  conn_structs;
+    unsigned int  curr_conns;
+    unsigned int  total_conns;
+    uint64_t      rejected_conns;
     unsigned int  reserved_fds;
-    unsigned int  hash_power_level; /* Better hope it's not over 9000 */
-    bool          hash_is_expanding; /* If the hash table is being expanded */
+    unsigned int  conn_structs;
+    uint64_t      get_cmds;
+    uint64_t      set_cmds;
+    uint64_t      touch_cmds;
+    uint64_t      get_hits;
+    uint64_t      get_misses;
+    uint64_t      touch_hits;
+    uint64_t      touch_misses;
+    uint64_t      evictions;
+    uint64_t      reclaimed;
+    time_t        started;          /* when the process was started */
     bool          accepting_conns;  /* whether we are currently accepting */
+    uint64_t      listen_disabled_num;
+    unsigned int  hash_power_level; /* Better hope it's not over 9000 */
+    uint64_t      hash_bytes;       /* size used for hash tables */
+    bool          hash_is_expanding; /* If the hash table is being expanded */
+    uint64_t      expired_unfetched; /* items reclaimed but never touched */
+    uint64_t      evicted_unfetched; /* items evicted but never touched */
     bool          slab_reassign_running; /* slab reassign in progress */
-    bool          lru_crawler_running; /* crawl in progress */
+    uint64_t      slabs_moved;       /* times slabs were moved around */
 };
 
 #define MAX_VERBOSITY_LEVEL 2
@@ -394,10 +283,8 @@ struct settings {
     char *inter;
     int verbose;
     rel_time_t oldest_live; /* ignore existing items older than this */
-    uint64_t oldest_cas; /* ignore existing items with CAS values lower than this */
     int evict_to_free;
     char *socketpath;   /* path to unix socket if using local socket */
-    char *auth_file;    /* path to user authentication file */
     int access;  /* access mask (a la chmod) for unix domain socket */
     double factor;          /* chunk size growth factor */
     int chunk_size;
@@ -410,74 +297,15 @@ struct settings {
     bool use_cas;
     enum protocol binding_protocol;
     int backlog;
-    int item_size_max;        /* Maximum item size */
-    int slab_chunk_size_max;  /* Upper end for chunks within slab pages. */
-    int slab_page_size;     /* Slab's page units. */
-    volatile sig_atomic_t sig_hup;  /* a HUP signal was received but not yet handled */
+    int item_size_max;        /* Maximum item size, and upper end for slabs */
     bool sasl;              /* SASL on/off */
     bool maxconns_fast;     /* Whether or not to early close connections */
-    bool lru_crawler;        /* Whether or not to enable the autocrawler thread */
-    bool lru_maintainer_thread; /* LRU maintainer background thread */
-    bool lru_segmented;     /* Use split or flat LRU's */
     bool slab_reassign;     /* Whether or not slab reassignment is allowed */
-    int slab_automove;     /* Whether or not to automatically move slabs */
-    double slab_automove_ratio; /* youngest must be within pct of oldest */
-    unsigned int slab_automove_window; /* window mover for algorithm */
+    bool slab_automove;     /* Whether or not to automatically move slabs */
     int hashpower_init;     /* Starting hash power level */
-    bool shutdown_command; /* allow shutdown command */
-    int tail_repair_time;   /* LRU tail refcount leak repair time */
-    bool flush_enabled;     /* flush_all enabled */
-    bool dump_enabled;      /* whether cachedump/metadump commands work */
-    char *hash_algorithm;     /* Hash algorithm in use */
-    int lru_crawler_sleep;  /* Microsecond sleep between items */
-    uint32_t lru_crawler_tocrawl; /* Number of items to crawl per run */
-    int hot_lru_pct; /* percentage of slab space for HOT_LRU */
-    int warm_lru_pct; /* percentage of slab space for WARM_LRU */
-    double hot_max_factor; /* HOT tail age relative to COLD tail */
-    double warm_max_factor; /* WARM tail age relative to COLD tail */
-    int crawls_persleep; /* Number of LRU crawls to run before sleeping */
-    bool temp_lru; /* TTL < temporary_ttl uses TEMP_LRU */
-    uint32_t temporary_ttl; /* temporary LRU threshold */
-    int idle_timeout;       /* Number of seconds to let connections idle */
-    unsigned int logger_watcher_buf_size; /* size of logger's per-watcher buffer */
-    unsigned int logger_buf_size; /* size of per-thread logger buffer */
-    unsigned int resp_obj_mem_limit; /* total megabytes allowable for resp objects */
-    unsigned int read_buf_mem_limit; /* total megabytes allowable for read buffers */
-    bool drop_privileges;   /* Whether or not to drop unnecessary process privileges */
-    bool watch_enabled; /* allows watch commands to be dropped */
-    bool relaxed_privileges;   /* Relax process restrictions when running testapp */
-#ifdef EXTSTORE
-    unsigned int ext_io_threadcount; /* number of IO threads to run. */
-    unsigned int ext_page_size; /* size in megabytes of storage pages. */
-    unsigned int ext_item_size; /* minimum size of items to store externally */
-    unsigned int ext_item_age; /* max age of tail item before storing ext. */
-    unsigned int ext_low_ttl; /* remaining TTL below this uses own pages */
-    unsigned int ext_recache_rate; /* counter++ % recache_rate == 0 > recache */
-    unsigned int ext_wbuf_size; /* read only note for the engine */
-    unsigned int ext_compact_under; /* when fewer than this many pages, compact */
-    unsigned int ext_drop_under; /* when fewer than this many pages, drop COLD items */
-    double ext_max_frag; /* ideal maximum page fragmentation */
-    double slab_automove_freeratio; /* % of memory to hold free as buffer */
-    bool ext_drop_unread; /* skip unread items during compaction */
-    /* per-slab-class free chunk limit */
-    unsigned int ext_free_memchunks[MAX_NUMBER_OF_SLAB_CLASSES];
-#endif
-#ifdef TLS
-    bool ssl_enabled; /* indicates whether SSL is enabled */
-    SSL_CTX *ssl_ctx; /* holds the SSL server context which has the server certificate */
-    char *ssl_chain_cert; /* path to the server SSL chain certificate */
-    char *ssl_key; /* path to the server key */
-    int ssl_verify_mode; /* client certificate verify mode */
-    int ssl_keyformat; /* key format , defult is PEM */
-    char *ssl_ciphers; /* list of SSL ciphers */
-    char *ssl_ca_cert; /* certificate with CAs. */
-    rel_time_t ssl_last_cert_refresh_time; /* time of the last server certificate refresh */
-    unsigned int ssl_wbuf_size; /* size of the write buffer used by ssl_sendmsg method */
-#endif
 };
 
 extern struct stats stats;
-extern struct stats_state stats_state;
 extern time_t process_started;
 extern struct settings settings;
 
@@ -487,38 +315,21 @@ extern struct settings settings;
 /* temp */
 #define ITEM_SLABBED 4
 
-/* Item was fetched at least once in its lifetime */
 #define ITEM_FETCHED 8
-/* Appended on fetch, removed on LRU shuffling */
-#define ITEM_ACTIVE 16
-/* If an item's storage are chained chunks. */
-#define ITEM_CHUNKED 32
-#define ITEM_CHUNK 64
-/* ITEM_data bulk is external to item */
-#define ITEM_HDR 128
-/* additional 4 bytes for item client flags */
-#define ITEM_CFLAGS 256
-/* item has sent out a token already */
-#define ITEM_TOKEN_SENT 512
-/* reserved, in case tokens should be a 2-bit count in future */
-#define ITEM_TOKEN_RESERVED 1024
-/* if item has been marked as a stale value */
-#define ITEM_STALE 2048
 
 /**
  * Structure for storing items within memcached.
  */
 typedef struct _stritem {
-    /* Protected by LRU locks */
     struct _stritem *next;
     struct _stritem *prev;
-    /* Rest are protected by an item lock */
     struct _stritem *h_next;    /* hash chain next */
     rel_time_t      time;       /* least recent access */
     rel_time_t      exptime;    /* expire time */
     int             nbytes;     /* size of data */
     unsigned short  refcount;
-    uint16_t        it_flags;   /* ITEM_* above */
+    uint8_t         nsuffix;    /* length of flags-and-length string */
+    uint8_t         it_flags;   /* ITEM_* above */
     uint8_t         slabs_clsid;/* which slab class we're in */
     uint8_t         nkey;       /* key length, w/terminating null and padding */
     /* this odd type prevents type-punning issues when we do
@@ -533,67 +344,6 @@ typedef struct _stritem {
     /* then data with terminating \r\n (no terminating null; it's binary!) */
 } item;
 
-// TODO: If we eventually want user loaded modules, we can't use an enum :(
-enum crawler_run_type {
-    CRAWLER_AUTOEXPIRE=0, CRAWLER_EXPIRED, CRAWLER_METADUMP
-};
-
-typedef struct {
-    struct _stritem *next;
-    struct _stritem *prev;
-    struct _stritem *h_next;    /* hash chain next */
-    rel_time_t      time;       /* least recent access */
-    rel_time_t      exptime;    /* expire time */
-    int             nbytes;     /* size of data */
-    unsigned short  refcount;
-    uint16_t        it_flags;   /* ITEM_* above */
-    uint8_t         slabs_clsid;/* which slab class we're in */
-    uint8_t         nkey;       /* key length, w/terminating null and padding */
-    uint32_t        remaining;  /* Max keys to crawl per slab per invocation */
-    uint64_t        reclaimed;  /* items reclaimed during this crawl. */
-    uint64_t        unfetched;  /* items reclaimed unfetched during this crawl. */
-    uint64_t        checked;    /* items examined during this crawl. */
-} crawler;
-
-/* Header when an item is actually a chunk of another item. */
-typedef struct _strchunk {
-    struct _strchunk *next;     /* points within its own chain. */
-    struct _strchunk *prev;     /* can potentially point to the head. */
-    struct _stritem  *head;     /* always points to the owner chunk */
-    int              size;      /* available chunk space in bytes */
-    int              used;      /* chunk space used */
-    int              nbytes;    /* used. */
-    unsigned short   refcount;  /* used? */
-    uint16_t         it_flags;  /* ITEM_* above. */
-    uint8_t          slabs_clsid; /* Same as above. */
-    uint8_t          orig_clsid; /* For obj hdr chunks slabs_clsid is fake. */
-    char data[];
-} item_chunk;
-
-#ifdef NEED_ALIGN
-static inline char *ITEM_schunk(item *it) {
-    int offset = it->nkey + 1
-        + ((it->it_flags & ITEM_CFLAGS) ? sizeof(uint32_t) : 0)
-        + ((it->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0);
-    int remain = offset % 8;
-    if (remain != 0) {
-        offset += 8 - remain;
-    }
-    return ((char *) &(it->data)) + offset;
-}
-#else
-#define ITEM_schunk(item) ((char*) &((item)->data) + (item)->nkey + 1 \
-         + (((item)->it_flags & ITEM_CFLAGS) ? sizeof(uint32_t) : 0) \
-         + (((item)->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0))
-#endif
-
-#ifdef EXTSTORE
-typedef struct {
-    unsigned int page_version; /* from IO header */
-    unsigned int offset; /* from IO header */
-    unsigned short page_id; /* from IO header */
-} item_hdr;
-#endif
 typedef struct {
     pthread_t thread_id;        /* unique ID of this thread */
     struct event_base *base;    /* libevent handle this thread uses */
@@ -602,86 +352,23 @@ typedef struct {
     int notify_send_fd;         /* sending end of notify pipe */
     struct thread_stats stats;  /* Stats generated by this thread */
     struct conn_queue *new_conn_queue; /* queue of new connections to handle */
-    cache_t *resp_cache;        /* response objects */
-    cache_t *rbuf_cache;        /* static-sized read buffers */
-#ifdef EXTSTORE
-    cache_t *io_cache;          /* IO objects */
-    void *storage;              /* data object for storage system */
-#endif
-    logger *l;                  /* logger buffer */
-    void *lru_bump_buf;         /* async LRU bump buffer */
-#ifdef TLS
-    char   *ssl_wbuf;
-#endif
-
+    cache_t *suffix_cache;      /* suffix cache */
 } LIBEVENT_THREAD;
 
-/**
- * Response objects
- */
-#define MC_RESP_IOVCOUNT 4
-typedef struct _mc_resp {
-    struct _mc_resp *next; // choo choo.
-    int wbytes; // bytes to write out of wbuf: might be able to nuke this.
-    int tosend; // total bytes to send for this response
-    void *write_and_free; /** free this memory after finishing writing */
+typedef struct {
+    pthread_t thread_id;        /* unique ID of this thread */
+    struct event_base *base;    /* libevent handle this thread uses */
+} LIBEVENT_DISPATCHER_THREAD;
 
-    item *item; /* item associated with this response object, with reference held */
-    struct iovec iov[MC_RESP_IOVCOUNT]; /* built-in iovecs to simplify network code */
-    int chunked_total; /* total amount of chunked item data to send. */
-    uint8_t iovcnt;
-    uint8_t chunked_data_iov; /* this iov is a pointer to chunked data header */
-
-    /* instruct transmit to skip this response object. used by storage engines
-     * to asynchronously kill an object that was queued to write
-     */
-    bool skip;
-    bool free; // double free detection.
-    // UDP bits. Copied in from the client.
-    uint16_t    request_id; /* Incoming UDP request ID, if this is a UDP "connection" */
-    uint16_t    udp_sequence; /* packet counter when transmitting result */
-    uint16_t    udp_total; /* total number of packets in sequence */
-    struct sockaddr_in6 request_addr; /* udp: Who sent this request */
-    socklen_t request_addr_size;
-
-    char wbuf[WRITE_BUFFER_SIZE];
-} mc_resp;
-
-typedef struct conn conn;
-#ifdef EXTSTORE
-typedef struct _io_wrap {
-    obj_io io;
-    struct _io_wrap *next;
-    conn *c;
-    item *hdr_it;             /* original header item. */
-    mc_resp *resp;            /* associated response object */
-    unsigned int iovec_data;  /* specific index of data iovec */
-    bool noreply;             /* whether the response had noreply set */
-    bool miss;                /* signal a miss to unlink hdr_it */
-    bool badcrc;              /* signal a crc failure */
-    bool active;              /* tells if IO was dispatched or not */
-} io_wrap;
-#endif
 /**
  * The structure representing a connection into memcached.
  */
+typedef struct conn conn;
 struct conn {
-    sasl_conn_t *sasl_conn;
     int    sfd;
-    bool sasl_started;
-    bool authenticated;
-    bool set_stale;
-    bool mset_res; /** uses mset format for return code */
-    bool close_after_write; /** flush write then move to close connection */
-    bool rbuf_malloced; /** read buffer was malloc'ed for ascii mget, needs free() */
-#ifdef TLS
-    SSL    *ssl;
-    char   *ssl_wbuf;
-    bool ssl_enabled;
-#endif
+    sasl_conn_t *sasl_conn;
     enum conn_states  state;
     enum bin_substates substate;
-    rel_time_t last_cmd_time;
     struct event event;
     short  ev_flags;
     short  which;   /** which events were just triggered */
@@ -691,10 +378,18 @@ struct conn {
     int    rsize;   /** total allocated size of rbuf */
     int    rbytes;  /** how much data, starting from rcur, do we have unparsed */
 
-    mc_resp *resp; // tail response.
-    mc_resp *resp_head; // first response in current stack.
+    char   *wbuf;
+    char   *wcurr;
+    int    wsize;
+    int    wbytes;
+    /** which state to go into after finishing current write */
+    enum conn_states  write_and_go;
+    void   *write_and_free; /** free this memory after finishing writing */
+
     char   *ritem;  /** when we read in an item's value, it goes here */
     int    rlbytes;
+
+    /* data for the nread state */
 
     /**
      * item is used to hold an item structure created after reading the command
@@ -707,19 +402,36 @@ struct conn {
     /* data for the swallow state */
     int    sbytes;    /* how many bytes to swallow */
 
-#ifdef EXTSTORE
-    int io_wrapleft;
-    unsigned int recache_counter;
-    io_wrap *io_wraplist; /* linked list of io_wraps */
-    bool io_queued; /* FIXME: debugging flag */
-#endif
+    /* data for the mwrite state */
+    struct iovec *iov;
+    int    iovsize;   /* number of elements allocated in iov[] */
+    int    iovused;   /* number of elements used in iov[] */
+
+    struct msghdr *msglist;
+    int    msgsize;   /* number of elements allocated in msglist[] */
+    int    msgused;   /* number of elements used in msglist[] */
+    int    msgcurr;   /* element in msglist[] being transmitted now */
+    int    msgbytes;  /* number of bytes in current msg */
+
+    item   **ilist;   /* list of items to write out */
+    int    isize;
+    item   **icurr;
+    int    ileft;
+
+    char   **suffixlist;
+    int    suffixsize;
+    char   **suffixcurr;
+    int    suffixleft;
+
     enum protocol protocol;   /* which protocol this connection speaks */
     enum network_transport transport; /* what transport is used by this connection */
 
     /* data for UDP clients */
     int    request_id; /* Incoming UDP request ID, if this is a UDP "connection" */
-    struct sockaddr_in6 request_addr; /* udp: Who sent the most recent request */
+    struct sockaddr request_addr; /* Who sent the most recent request */
     socklen_t request_addr_size;
+    unsigned char *hdrbuf; /* udp packet headers */
+    int    hdrsize;   /* number of headers' worth of space is allocated */
 
     bool   noreply;   /* True if the reply should not be sent. */
     /* current stats command */
@@ -738,14 +450,8 @@ struct conn {
     int keylen;
     conn   *next;     /* Used for generating a list of conn structures */
     LIBEVENT_THREAD *thread; /* Pointer to the thread object serving this connection */
-    int (*try_read_command)(conn *c); /* pointer for top level input parser */
-    ssize_t (*read)(conn  *c, void *buf, size_t count);
-    ssize_t (*sendmsg)(conn *c, struct msghdr *msg, int flags);
-    ssize_t (*write)(conn *c, void *buf, size_t count);
 };
 
-/* array of conn structures, indexed by file descriptor */
-extern conn **conns;
 
 /* current time of day (updated periodically) */
 extern volatile rel_time_t current_time;
@@ -759,21 +465,12 @@ struct slab_rebalance {
     void *slab_pos;
     int s_clsid;
     int d_clsid;
-    uint32_t busy_items;
-    uint32_t rescues;
-    uint32_t evictions_nomem;
-    uint32_t inline_reclaim;
-    uint32_t chunk_rescues;
-    uint32_t busy_deletes;
-    uint32_t busy_loops;
+    int busy_items;
     uint8_t done;
-    uint8_t *completed;
 };
 
 extern struct slab_rebalance slab_rebal;
-#ifdef EXTSTORE
-extern void *ext_storage;
-#endif
+
 /*
  * Functions
  */
@@ -781,23 +478,23 @@ void do_accept_new_conns(const bool do_accept);
 enum delta_result_type do_add_delta(conn *c, const char *key,
                                     const size_t nkey, const bool incr,
                                     const int64_t delta, char *buf,
-                                    uint64_t *cas, const uint32_t hv,
-                                    item **it_ret);
+                                    uint64_t *cas, const uint32_t hv);
 enum store_item_type do_store_item(item *item, int comm, conn* c, const uint32_t hv);
-conn *conn_new(const int sfd, const enum conn_states init_state, const int event_flags, const int read_buffer_size,
-    enum network_transport transport, struct event_base *base, void *ssl);
-
-void conn_worker_readd(conn *c);
+conn *conn_new(const int sfd, const enum conn_states init_state, const int event_flags, const int read_buffer_size, enum network_transport transport, struct event_base *base);
 extern int daemonize(int nochdir, int noclose);
 
-#define mutex_lock(x) pthread_mutex_lock(x)
+static inline int mutex_lock(pthread_mutex_t *mutex)
+{
+    while (pthread_mutex_trylock(mutex));
+    return 0;
+}
+
 #define mutex_unlock(x) pthread_mutex_unlock(x)
 
-#include "stats_prefix.h"
+#include "stats.h"
 #include "slabs.h"
 #include "assoc.h"
 #include "items.h"
-#include "crawler.h"
 #include "trace.h"
 #include "hash.h"
 #include "util.h"
@@ -808,45 +505,39 @@ extern int daemonize(int nochdir, int noclose);
  * in the current thread) are called via "dispatch_" frontends, which are
  * also #define-d to directly call the underlying code in singlethreaded mode.
  */
-void memcached_thread_init(int nthreads, void *arg);
-void redispatch_conn(conn *c);
-void dispatch_conn_new(int sfd, enum conn_states init_state, int event_flags, int read_buffer_size,
-    enum network_transport transport, void *ssl);
-void sidethread_conn_close(conn *c);
+
+void thread_init(int nthreads, struct event_base *main_base);
+int  dispatch_event_add(int thread, conn *c);
+void dispatch_conn_new(int sfd, enum conn_states init_state, int event_flags, int read_buffer_size, enum network_transport transport);
 
 /* Lock wrappers for cache functions that are called from main loop. */
 enum delta_result_type add_delta(conn *c, const char *key,
-                                 const size_t nkey, bool incr,
+                                 const size_t nkey, const int incr,
                                  const int64_t delta, char *buf,
                                  uint64_t *cas);
 void accept_new_conns(const bool do_accept);
 conn *conn_from_freelist(void);
 bool  conn_add_to_freelist(conn *c);
-void  conn_close_idle(conn *c);
+int   is_listen_thread(void);
 item *item_alloc(char *key, size_t nkey, int flags, rel_time_t exptime, int nbytes);
-#define DO_UPDATE true
-#define DONT_UPDATE false
-item *item_get(const char *key, const size_t nkey, conn *c, const bool do_update);
-item *item_get_locked(const char *key, const size_t nkey, conn *c, const bool do_update, uint32_t *hv);
-item *item_touch(const char *key, const size_t nkey, uint32_t exptime, conn *c);
+char *item_cachedump(const unsigned int slabs_clsid, const unsigned int limit, unsigned int *bytes);
+void  item_flush_expired(void);
+item *item_get(const char *key, const size_t nkey);
+item *item_touch(const char *key, const size_t nkey, uint32_t exptime);
 int   item_link(item *it);
 void  item_remove(item *it);
 int   item_replace(item *it, item *new_it, const uint32_t hv);
+void  item_stats(ADD_STAT add_stats, void *c);
+void  item_stats_sizes(ADD_STAT add_stats, void *c);
 void  item_unlink(item *it);
+void  item_update(item *it);
 
 void item_lock(uint32_t hv);
-void *item_trylock(uint32_t hv);
-void item_trylock_unlock(void *arg);
 void item_unlock(uint32_t hv);
-void pause_threads(enum pause_thread_types type);
-void stop_threads(void);
-int stop_conn_timeout_thread(void);
-#define refcount_incr(it) ++(it->refcount)
-#define refcount_decr(it) --(it->refcount)
+unsigned short refcount_incr(unsigned short *refcount);
+unsigned short refcount_decr(unsigned short *refcount);
 void STATS_LOCK(void);
 void STATS_UNLOCK(void);
-#define THR_STATS_LOCK(c) pthread_mutex_lock(&c->thread->stats.mutex)
-#define THR_STATS_UNLOCK(c) pthread_mutex_unlock(&c->thread->stats.mutex)
 void threadlocal_stats_reset(void);
 void threadlocal_stats_aggregate(struct thread_stats *stats);
 void slab_stats_aggregate(struct thread_stats *stats, struct slab_stats *out);
@@ -858,17 +549,9 @@ void append_stat(const char *name, ADD_STAT add_stats, conn *c,
 enum store_item_type store_item(item *item, int comm, conn *c);
 
 #if HAVE_DROP_PRIVILEGES
-extern void setup_privilege_violations_handler(void);
 extern void drop_privileges(void);
 #else
-#define setup_privilege_violations_handler()
 #define drop_privileges()
-#endif
-
-#if HAVE_DROP_WORKER_PRIVILEGES
-extern void drop_worker_privileges(void);
-#else
-#define drop_worker_privileges()
 #endif
 
 /* If supported, give compiler hints for branch prediction. */

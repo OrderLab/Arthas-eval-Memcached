@@ -13,7 +13,7 @@ use Test::More;
 
 if (supports_sasl()) {
     if ($ENV{'RUN_SASL_TESTS'}) {
-        plan tests => 34;
+        plan tests => 25;
     } else {
         plan skip_all => 'Skipping SASL tests';
         exit 0;
@@ -92,7 +92,7 @@ use constant RES_MAGIC        => 0x81;
 my $pwd=getcwd;
 $ENV{'SASL_CONF_PATH'} = "$pwd/t/sasl";
 
-my $server = new_memcached('-B binary -U 0 -S -l 127.0.0.1 ');
+my $server = new_memcached('-B binary -S ');
 
 my $mc = MC::Client->new;
 
@@ -191,11 +191,8 @@ for my $dir (split(/:/, $ENV{PATH}),
         last;
     }
 }
-die "no saslpasswd2 found" unless $saslpasswd_path;
 
-my $sasl_realm = 'memcached.realm';
-
-system("echo testpass | $saslpasswd_path -a memcached -u $sasl_realm -c -p testuser");
+system("echo testpass | $saslpasswd_path -a memcached -c -p testuser");
 
 $mc = MC::Client->new;
 
@@ -232,43 +229,6 @@ $check->('x','somevalue');
 }
 $empty->('x');
 
-{
-    my $mc = MC::Client->new;
-
-    # Attempt bad authentication.
-    is ($mc->authenticate('testuser', 'wrongpassword'), 0x20, "bad auth");
-
-    # This should fail because $mc is not authenticated
-    my ($status, $val)= $mc->set('x', "somevalue");
-    ok($status, "this fails to authenticate");
-    cmp_ok($status,'==',ERR_AUTH_ERROR, "error code matches");
-}
-$empty->('x', 'somevalue');
-
-{
-    my $mc = MC::Client->new;
-
-    # Attempt bad authentication.
-    is ($mc->authenticate('testuser', 'wrongpassword'), 0x20, "bad auth");
-
-    # Mix an authenticated connection and an unauthenticated connection to
-    # confirm c->authenticated is not shared among connections
-    my $mc2 = MC::Client->new;
-    is ($mc2->authenticate('testuser', 'testpass'), 0, "authenticated");
-    my ($status, $val)= $mc2->set('x', "somevalue");
-    ok(! $status);
-
-    # This should fail because $mc is not authenticated
-    ($status, $val)= $mc->set('x', "somevalue");
-    ok($status, "this fails to authenticate");
-    cmp_ok($status,'==',ERR_AUTH_ERROR, "error code matches");
-}
-
-{
-    my $mc = MC::Client->new;
-    is ($mc->sasl_step('testuser', 'testpass'), 0x20, "sasl_step_fails_no_segfault");
-}
-
 # check the SASL stats, make sure they track things correctly
 # note: the enabled or not is presence checked in stats.t
 
@@ -281,8 +241,8 @@ $empty->('x', 'somevalue');
 
 {
     my %stats = $mc->stats('');
-    is ($stats{'auth_cmds'}, 6, "auth commands counted");
-    is ($stats{'auth_errors'}, 4, "auth errors correct");
+    is ($stats{'auth_cmds'}, 2, "auth commands counted");
+    is ($stats{'auth_errors'}, 1, "auth errors correct");
 }
 
 
@@ -317,15 +277,8 @@ sub new {
 sub authenticate {
     my ($self, $user, $pass, $mech)= @_;
     $mech ||= 'PLAIN';
-    my $buf = sprintf("%c%s@%s%c%s", 0, $user, $sasl_realm, 0, $pass);
+    my $buf = sprintf("%c%s%c%s", 0, $user, 0, $pass);
     my ($status, $rv, undef) = $self->_do_command(::CMD_SASL_AUTH, $mech, $buf, '');
-    return $status;
-}
-sub sasl_step {
-    my ($self, $user, $pass, $mech)= @_;
-    $mech ||= 'PLAIN';
-    my $buf = sprintf("%c%s@%s%c%s", 0, $user, $sasl_realm, 0, $pass);
-    my ($status, $rv, undef) = $self->_do_command(::CMD_SASL_STEP, $mech, $buf, '');
     return $status;
 }
 sub list_mechs {
@@ -676,3 +629,4 @@ sub auth_error {
 unlink $sasldb;
 
 # vim: filetype=perl
+

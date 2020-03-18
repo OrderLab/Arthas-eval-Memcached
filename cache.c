@@ -45,12 +45,6 @@ cache_t* cache_create(const char *name, size_t bufsize, size_t align,
     return ret;
 }
 
-void cache_set_limit(cache_t *cache, int limit) {
-    pthread_mutex_lock(&cache->mutex);
-    cache->limit = limit;
-    pthread_mutex_unlock(&cache->mutex);
-}
-
 static inline void* get_object(void *ptr) {
 #ifndef NDEBUG
     uint64_t *pre = ptr;
@@ -71,24 +65,16 @@ void cache_destroy(cache_t *cache) {
     free(cache->name);
     free(cache->ptr);
     pthread_mutex_destroy(&cache->mutex);
-    free(cache);
 }
 
 void* cache_alloc(cache_t *cache) {
     void *ret;
-    pthread_mutex_lock(&cache->mutex);
-    ret = do_cache_alloc(cache);
-    pthread_mutex_unlock(&cache->mutex);
-    return ret;
-}
-
-void* do_cache_alloc(cache_t *cache) {
-    void *ret;
     void *object;
+    pthread_mutex_lock(&cache->mutex);
     if (cache->freecurr > 0) {
         ret = cache->ptr[--cache->freecurr];
         object = get_object(ret);
-    } else if (cache->limit == 0 || cache->total < cache->limit) {
+    } else {
         object = ret = malloc(cache->bufsize);
         if (ret != NULL) {
             object = get_object(ret);
@@ -98,11 +84,9 @@ void* do_cache_alloc(cache_t *cache) {
                 free(ret);
                 object = NULL;
             }
-            cache->total++;
         }
-    } else {
-        object = NULL;
     }
+    pthread_mutex_unlock(&cache->mutex);
 
 #ifndef NDEBUG
     if (object != NULL) {
@@ -120,17 +104,14 @@ void* do_cache_alloc(cache_t *cache) {
 
 void cache_free(cache_t *cache, void *ptr) {
     pthread_mutex_lock(&cache->mutex);
-    do_cache_free(cache, ptr);
-    pthread_mutex_unlock(&cache->mutex);
-}
 
-void do_cache_free(cache_t *cache, void *ptr) {
 #ifndef NDEBUG
     /* validate redzone... */
     if (memcmp(((char*)ptr) + cache->bufsize - (2 * sizeof(redzone_pattern)),
                &redzone_pattern, sizeof(redzone_pattern)) != 0) {
         raise(SIGABRT);
         cache_error = 1;
+        pthread_mutex_unlock(&cache->mutex);
         return;
     }
     uint64_t *pre = ptr;
@@ -138,18 +119,12 @@ void do_cache_free(cache_t *cache, void *ptr) {
     if (*pre != redzone_pattern) {
         raise(SIGABRT);
         cache_error = -1;
+        pthread_mutex_unlock(&cache->mutex);
         return;
     }
     ptr = pre;
 #endif
-    if (cache->limit > cache->total) {
-        /* Allow freeing in case the limit was revised downward */
-        if (cache->destructor) {
-            cache->destructor(ptr, NULL);
-        }
-        free(ptr);
-        cache->total--;
-    } else if (cache->freecurr < cache->freetotal) {
+    if (cache->freecurr < cache->freetotal) {
         cache->ptr[cache->freecurr++] = ptr;
     } else {
         /* try to enlarge free connections array */
@@ -164,8 +139,9 @@ void do_cache_free(cache_t *cache, void *ptr) {
                 cache->destructor(ptr, NULL);
             }
             free(ptr);
-            cache->total--;
+
         }
     }
+    pthread_mutex_unlock(&cache->mutex);
 }
 

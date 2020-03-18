@@ -47,7 +47,9 @@
               <xsl:value-of select='@src'/>
             </xsl:when>
             <xsl:otherwise>
+              <xsl:text>http://xml.resource.org/public/rfc/</xsl:text>
               <xsl:value-of select='@src'/>
+              <xsl:text>.xml</xsl:text>
             </xsl:otherwise>
           </xsl:choose>
 	</xsl:param>

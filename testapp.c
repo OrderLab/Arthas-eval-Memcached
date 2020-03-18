@@ -20,81 +20,17 @@
 
 #include "config.h"
 #include "cache.h"
-#include "hash.h"
-#include "stats_prefix.h"
 #include "util.h"
 #include "protocol_binary.h"
-#ifdef TLS
-#include <openssl/ssl.h>
-#endif
 
 #define TMP_TEMPLATE "/tmp/test_file.XXXXXXX"
 
 enum test_return { TEST_SKIP, TEST_PASS, TEST_FAIL };
 
-struct conn {
-    int sock;
-#ifdef TLS
-    SSL_CTX   *ssl_ctx;
-    SSL    *ssl;
-#endif
-    ssize_t (*read)(struct conn  *c, void *buf, size_t count);
-    ssize_t (*write)(struct conn *c, const void *buf, size_t count);
-};
-
-struct settings {
-    char *hash_algorithm;
-};
-struct settings settings;
-
-static ssize_t tcp_read(struct conn *c, void *buf, size_t count);
-static ssize_t tcp_write(struct conn *c, const void *buf, size_t count);
-#ifdef TLS
-static ssize_t ssl_read(struct conn *c, void *buf, size_t count);
-static ssize_t ssl_write(struct conn *c, const void *buf, size_t count);
-#endif
-
-ssize_t tcp_read(struct conn *c, void *buf, size_t count) {
-    assert(c != NULL);
-    return read(c->sock, buf, count);
-}
-
-ssize_t tcp_write(struct conn *c, const void *buf, size_t count) {
-    assert(c != NULL);
-    return write(c->sock, buf, count);
-}
-#ifdef TLS
-ssize_t ssl_read(struct conn *c, void *buf, size_t count) {
-    assert(c != NULL);
-    return SSL_read(c->ssl, buf, count);
-}
-
-ssize_t ssl_write(struct conn *c, const void *buf, size_t count) {
-    assert(c != NULL);
-    return SSL_write(c->ssl, buf, count);
-}
-#endif
-
 static pid_t server_pid;
 static in_port_t port;
-static struct conn *con = NULL;
+static int sock;
 static bool allow_closed_read = false;
-static bool enable_ssl = false;
-
-static void close_conn() {
-    if (con == NULL) return;
-#ifdef TLS
-    if (con->ssl) {
-        SSL_shutdown(con->ssl);
-        SSL_free(con->ssl);
-    }
-    if (con->ssl_ctx)
-        SSL_CTX_free(con->ssl_ctx);
-#endif
-    if (con->sock > 0) close(con->sock);
-    free(con);
-    con = NULL;
-}
 
 static enum test_return cache_create_test(void)
 {
@@ -217,7 +153,7 @@ static enum test_return cache_redzone_test(void)
     cache_t *cache = cache_create("test", sizeof(uint32_t), sizeof(char*),
                                   NULL, NULL);
 
-    /* Ignore SIGABRT */
+    /* Ignore SIGABORT */
     struct sigaction old_action;
     struct sigaction action = { .sa_handler = SIG_IGN, .sa_flags = 0};
     sigemptyset(&action.sa_mask);
@@ -244,148 +180,6 @@ static enum test_return cache_redzone_test(void)
 #else
     return TEST_SKIP;
 #endif
-}
-
-static enum test_return test_stats_prefix_find(void) {
-    PREFIX_STATS *pfs1, *pfs2;
-
-    stats_prefix_clear();
-    pfs1 = stats_prefix_find("abc", 3);
-    assert(pfs1 == NULL);
-    pfs1 = stats_prefix_find("abc|", 4);
-    assert(pfs1 == NULL);
-
-    pfs1 = stats_prefix_find("abc:", 4);
-    assert(pfs1 != NULL);
-    assert(0ULL == (pfs1->num_gets + pfs1->num_sets + pfs1->num_deletes + pfs1->num_hits));
-    pfs2 = stats_prefix_find("abc:", 4);
-    assert(pfs1 == pfs2);
-    pfs2 = stats_prefix_find("abc:d", 5);
-    assert(pfs1 == pfs2);
-    pfs2 = stats_prefix_find("xyz123:", 6);
-    assert(pfs1 != pfs2);
-    pfs2 = stats_prefix_find("ab:", 3);
-    assert(pfs1 != pfs2);
-    return TEST_PASS;
-}
-
-static enum test_return test_stats_prefix_record_get(void) {
-    PREFIX_STATS *pfs;
-    stats_prefix_clear();
-
-    stats_prefix_record_get("abc:123", 7, false);
-    pfs = stats_prefix_find("abc:123", 7);
-    assert(1 == pfs->num_gets);
-    assert(0 == pfs->num_hits);
-    stats_prefix_record_get("abc:456", 7, false);
-    assert(2 == pfs->num_gets);
-    assert(0 == pfs->num_hits);
-    stats_prefix_record_get("abc:456", 7, true);
-    assert(3 == pfs->num_gets);
-    assert(1 == pfs->num_hits);
-    stats_prefix_record_get("def:", 4, true);
-    assert(3 == pfs->num_gets);
-    assert(1 == pfs->num_hits);
-    return TEST_PASS;
-}
-
-static enum test_return test_stats_prefix_record_delete(void) {
-    PREFIX_STATS *pfs;
-    stats_prefix_clear();
-
-    stats_prefix_record_delete("abc:123", 7);
-    pfs = stats_prefix_find("abc:123", 7);
-    assert(0 == pfs->num_gets);
-    assert(0 == pfs->num_hits);
-    assert(1 == pfs->num_deletes);
-    assert(0 == pfs->num_sets);
-    stats_prefix_record_delete("def:", 4);
-    assert(1 == pfs->num_deletes);
-    return TEST_PASS;
-}
-
-static enum test_return test_stats_prefix_record_set(void) {
-    PREFIX_STATS *pfs;
-    stats_prefix_clear();
-
-    stats_prefix_record_set("abc:123", 7);
-    pfs = stats_prefix_find("abc:123", 7);
-    assert(0 == pfs->num_gets);
-    assert(0 == pfs->num_hits);
-    assert(0 == pfs->num_deletes);
-    assert(1 == pfs->num_sets);
-    stats_prefix_record_delete("def:", 4);
-    assert(1 == pfs->num_sets);
-    return TEST_PASS;
-}
-
-static enum test_return test_stats_prefix_dump(void) {
-    int hashval = hash("abc", 3) % PREFIX_HASH_SIZE;
-    char tmp[500];
-    char *buf;
-    const char *expected;
-    int keynum;
-    int length;
-
-    stats_prefix_clear();
-
-    assert(strcmp("END\r\n", (buf = stats_prefix_dump(&length))) == 0);
-    assert(5 == length);
-    stats_prefix_record_set("abc:123", 7);
-    free(buf);
-    expected = "PREFIX abc get 0 hit 0 set 1 del 0\r\nEND\r\n";
-    assert(strcmp(expected, (buf = stats_prefix_dump(&length))) == 0);
-    assert(strlen(expected) == length);
-    stats_prefix_record_get("abc:123", 7, false);
-    free(buf);
-    expected = "PREFIX abc get 1 hit 0 set 1 del 0\r\nEND\r\n";
-    assert(strcmp(expected, (buf = stats_prefix_dump(&length))) == 0);
-    assert(strlen(expected) == length);
-    stats_prefix_record_get("abc:123", 7, true);
-    free(buf);
-    expected = "PREFIX abc get 2 hit 1 set 1 del 0\r\nEND\r\n";
-    assert(strcmp(expected, (buf = stats_prefix_dump(&length))) == 0);
-    assert(strlen(expected) == length);
-    stats_prefix_record_delete("abc:123", 7);
-    free(buf);
-    expected = "PREFIX abc get 2 hit 1 set 1 del 1\r\nEND\r\n";
-    assert(strcmp(expected, (buf = stats_prefix_dump(&length))) == 0);
-    assert(strlen(expected) == length);
-
-    stats_prefix_record_delete("def:123", 7);
-    free(buf);
-    /* NOTE: Prefixes can be dumped in any order, so we verify that
-       each expected line is present in the string. */
-    buf = stats_prefix_dump(&length);
-    assert(strstr(buf, "PREFIX abc get 2 hit 1 set 1 del 1\r\n") != NULL);
-    assert(strstr(buf, "PREFIX def get 0 hit 0 set 0 del 1\r\n") != NULL);
-    assert(strstr(buf, "END\r\n") != NULL);
-    free(buf);
-
-    /* Find a key that hashes to the same bucket as "abc" */
-    bool found_match = false;
-    for (keynum = 0; keynum < PREFIX_HASH_SIZE * 100; keynum++) {
-        snprintf(tmp, sizeof(tmp), "%d:", keynum);
-        /* -1 because only the prefix portion is used when hashing */
-        if (hashval == hash(tmp, strlen(tmp) - 1) % PREFIX_HASH_SIZE) {
-            found_match = true;
-            break;
-        }
-    }
-    assert(found_match);
-    stats_prefix_record_set(tmp, strlen(tmp));
-    buf = stats_prefix_dump(&length);
-    assert(strstr(buf, "PREFIX abc get 2 hit 1 set 1 del 1\r\n") != NULL);
-    assert(strstr(buf, "PREFIX def get 0 hit 0 set 0 del 1\r\n") != NULL);
-    assert(strstr(buf, "END\r\n") != NULL);
-    snprintf(tmp, sizeof(tmp), "PREFIX %d get 0 hit 0 set 1 del 0\r\n", keynum);
-    assert(strstr(buf, tmp) != NULL);
-    free(buf);
-
-    /* Marking the end of these tests */
-    stats_prefix_clear();
-
-    return TEST_PASS;
 }
 
 static enum test_return test_safe_strtoul(void) {
@@ -524,7 +318,7 @@ static pid_t start_server(in_port_t *port_out, bool daemon, int timeout) {
 
     if (pid == 0) {
         /* Child */
-        char *argv[24];
+        char *argv[20];
         int arg = 0;
         char tmo[24];
         snprintf(tmo, sizeof(tmo), "%u", timeout);
@@ -540,20 +334,10 @@ static pid_t start_server(in_port_t *port_out, bool daemon, int timeout) {
             argv[arg++] = tmo;
         }
         argv[arg++] = "./memcached-debug";
-        argv[arg++] = "-A";
         argv[arg++] = "-p";
         argv[arg++] = "-1";
         argv[arg++] = "-U";
         argv[arg++] = "0";
-#ifdef TLS
-        if (enable_ssl) {
-            argv[arg++] = "-Z";
-            argv[arg++] = "-o";
-            argv[arg++] = "ssl_chain_cert=t/server_crt.pem";
-            argv[arg++] = "-o";
-            argv[arg++] = "ssl_key=t/server_key.pem";
-        }
-#endif
         /* Handle rpmbuild and the like doing this as root */
         if (getuid() == 0) {
             argv[arg++] = "-u";
@@ -566,10 +350,6 @@ static pid_t start_server(in_port_t *port_out, bool daemon, int timeout) {
         }
 #ifdef MESSAGE_DEBUG
          argv[arg++] = "-vvv";
-#endif
-#ifdef HAVE_DROP_PRIVILEGES
-        argv[arg++] = "-o";
-        argv[arg++] = "relaxed_privileges";
 #endif
         argv[arg++] = NULL;
         assert(execv(argv[0], argv) != -1);
@@ -602,8 +382,8 @@ static pid_t start_server(in_port_t *port_out, bool daemon, int timeout) {
     if (daemon) {
         /* loop and wait for the pid file.. There is a potential race
          * condition that the server just created the file but isn't
-         * finished writing the content, so we loop a few times
-         * reading as well */
+         * finished writing the content, but I'll take the chance....
+         */
         while (access(pid_file, F_OK) == -1) {
             usleep(10);
         }
@@ -614,11 +394,7 @@ static pid_t start_server(in_port_t *port_out, bool daemon, int timeout) {
                     strerror(errno));
             assert(false);
         }
-
-        /* Avoid race by retrying 20 times */
-        for (int x = 0; x < 20 && fgets(buffer, sizeof(buffer), fp) == NULL; x++) {
-            usleep(10);
-        }
+        assert(fgets(buffer, sizeof(buffer), fp) != NULL);
         fclose(fp);
 
         int32_t val;
@@ -660,16 +436,8 @@ static struct addrinfo *lookuphost(const char *hostname, in_port_t port)
     return ai;
 }
 
-static struct conn *connect_server(const char *hostname, in_port_t port,
-                            bool nonblock, const bool ssl)
+static int connect_server(const char *hostname, in_port_t port, bool nonblock)
 {
-    struct conn *c;
-    if (!(c = (struct conn *)calloc(1, sizeof(struct conn)))) {
-        fprintf(stderr, "Failed to allocate the client connection: %s\n",
-                strerror(errno));
-        return NULL;
-    }
-
     struct addrinfo *ai = lookuphost(hostname, port);
     int sock = -1;
     if (ai != NULL) {
@@ -695,49 +463,12 @@ static struct conn *connect_server(const char *hostname, in_port_t port,
 
        freeaddrinfo(ai);
     }
-    c->sock = sock;
-#ifdef TLS
-    if (sock > 0 && ssl) {
-        c->ssl_ctx = SSL_CTX_new(SSLv23_client_method());
-        if (c->ssl_ctx == NULL) {
-            fprintf(stderr, "Failed to create the SSL context: %s\n",
-                strerror(errno));
-            close(sock);
-            sock = -1;
-        }
-        c->ssl = SSL_new(c->ssl_ctx);
-        if (c->ssl == NULL) {
-            fprintf(stderr, "Failed to create the SSL object: %s\n",
-                strerror(errno));
-            close(sock);
-            sock = -1;
-        }
-        SSL_set_fd (c->ssl, c->sock);
-        int ret = SSL_connect(c->ssl);
-        if (ret < 0) {
-            int err = SSL_get_error(c->ssl, ret);
-            if (err == SSL_ERROR_SYSCALL || err == SSL_ERROR_SSL) {
-                fprintf(stderr, "SSL connection failed with error code : %s\n",
-                    strerror(errno));
-                close(sock);
-                sock = -1;
-            }
-        }
-        c->read = ssl_read;
-        c->write = ssl_write;
-    } else
-#endif
-    {
-        c->read = tcp_read;
-        c->write = tcp_write;
-    }
-    return c;
+    return sock;
 }
 
 static enum test_return test_vperror(void) {
     int rv = 0;
     int oldstderr = dup(STDERR_FILENO);
-    assert(oldstderr >= 0);
     char tmpl[sizeof(TMP_TEMPLATE)+1];
     strncpy(tmpl, TMP_TEMPLATE, sizeof(TMP_TEMPLATE)+1);
 
@@ -785,7 +516,7 @@ static void send_ascii_command(const char *buf) {
     size_t len = strlen(buf);
 
     do {
-        ssize_t nw = con->write((void*)con, ptr + offset, len - offset);
+        ssize_t nw = write(sock, ptr + offset, len - offset);
         if (nw == -1) {
             if (errno != EINTR) {
                 fprintf(stderr, "Failed to write: %s\n", strerror(errno));
@@ -807,7 +538,7 @@ static void read_ascii_response(char *buffer, size_t size) {
     off_t offset = 0;
     bool need_more = true;
     do {
-        ssize_t nr = con->read(con, buffer + offset, 1);
+        ssize_t nr = read(sock, buffer + offset, 1);
         if (nr == -1) {
             if (errno != EINTR) {
                 fprintf(stderr, "Failed to read: %s\n", strerror(errno));
@@ -828,12 +559,10 @@ static void read_ascii_response(char *buffer, size_t size) {
 static enum test_return test_issue_92(void) {
     char buffer[1024];
 
-    close_conn();
-    con = connect_server("127.0.0.1", port, false, enable_ssl);
-    assert(con);
+    close(sock);
+    sock = connect_server("127.0.0.1", port, false);
 
     send_ascii_command("stats cachedump 1 0 0\r\n");
-
     read_ascii_response(buffer, sizeof(buffer));
     assert(strncmp(buffer, "END", strlen("END")) == 0);
 
@@ -841,9 +570,8 @@ static enum test_return test_issue_92(void) {
     read_ascii_response(buffer, sizeof(buffer));
     assert(strncmp(buffer, "CLIENT_ERROR", strlen("CLIENT_ERROR")) == 0);
 
-    close_conn();
-    con = connect_server("127.0.0.1", port, false, enable_ssl);
-    assert(con);
+    close(sock);
+    sock = connect_server("127.0.0.1", port, false);
     return TEST_PASS;
 }
 
@@ -852,17 +580,14 @@ static enum test_return test_issue_102(void) {
     memset(buffer, ' ', sizeof(buffer));
     buffer[sizeof(buffer) - 1] = '\0';
 
-    close_conn();
-    con = connect_server("127.0.0.1", port, false, enable_ssl);
-    assert(con);
+    close(sock);
+    sock = connect_server("127.0.0.1", port, false);
 
     send_ascii_command(buffer);
     /* verify that the server closed the connection */
-    assert(con->read(con, buffer, sizeof(buffer)) == 0);
-
-    close_conn();
-    con = connect_server("127.0.0.1", port, false, enable_ssl);
-    assert(con);
+    assert(read(sock, buffer, sizeof(buffer)) == 0);
+    close(sock);
+    sock = connect_server("127.0.0.1", port, false);
 
     snprintf(buffer, sizeof(buffer), "gets ");
     size_t offset = 5;
@@ -891,50 +616,23 @@ static enum test_return test_issue_102(void) {
     buffer[sizeof(buffer) - 1] = '\0';
     send_ascii_command(buffer);
     /* verify that the server closed the connection */
-    assert(con->read(con, buffer, sizeof(buffer)) == 0);
+    assert(read(sock, buffer, sizeof(buffer)) == 0);
 
-    close_conn();
-    con = connect_server("127.0.0.1", port, false, enable_ssl);
-    assert(con);
+    close(sock);
+    sock = connect_server("127.0.0.1", port, false);
 
     return TEST_PASS;
 }
 
 static enum test_return start_memcached_server(void) {
     server_pid = start_server(&port, false, 600);
-    close_conn();
-    con = connect_server("127.0.0.1", port, false, enable_ssl);
-    assert(con);
+    sock = connect_server("127.0.0.1", port, false);
     return TEST_PASS;
 }
 
 static enum test_return stop_memcached_server(void) {
-    close_conn();
-    if (server_pid != -1) {
-        assert(kill(server_pid, SIGTERM) == 0);
-    }
-
-    return TEST_PASS;
-}
-
-static enum test_return shutdown_memcached_server(void) {
-    char buffer[1024];
-
-    close_conn();
-    con = connect_server("127.0.0.1", port, false, enable_ssl);
-    assert(con);
-
-    send_ascii_command("shutdown\r\n");
-    /* verify that the server closed the connection */
-    assert(con->read(con, buffer, sizeof(buffer)) == 0);
-
-    close_conn();
-
-    /* We set server_pid to -1 so that we don't later call kill() */
-    if (kill(server_pid, 0) == 0) {
-        server_pid = -1;
-    }
-
+    close(sock);
+    assert(kill(server_pid, SIGTERM) == 0);
     return TEST_PASS;
 }
 
@@ -964,7 +662,8 @@ static void safe_send(const void* buf, size_t len, bool hickup)
                 num_bytes = (rand() % 1023) + 1;
             }
         }
-        ssize_t nw = con->write(con, ptr + offset, num_bytes);
+
+        ssize_t nw = write(sock, ptr + offset, num_bytes);
         if (nw == -1) {
             if (errno != EINTR) {
                 fprintf(stderr, "Failed to write: %s\n", strerror(errno));
@@ -985,7 +684,7 @@ static bool safe_recv(void *buf, size_t len) {
     }
     off_t offset = 0;
     do {
-        ssize_t nr = con->read(con, ((char*)buf) + offset, len - offset);
+        ssize_t nr = read(sock, ((char*)buf) + offset, len - offset);
         if (nr == -1) {
             if (errno != EINTR) {
                 fprintf(stderr, "Failed to read: %s\n", strerror(errno));
@@ -1073,43 +772,6 @@ static off_t storage_command(char*buf,
     return key_offset + keylen + dtalen;
 }
 
-static off_t ext_command(char* buf,
-                         size_t bufsz,
-                         uint8_t cmd,
-                         const void* ext,
-                         size_t extlen,
-                         const void* key,
-                         size_t keylen,
-                         const void* dta,
-                         size_t dtalen) {
-    protocol_binary_request_no_extras *request = (void*)buf;
-    assert(bufsz > sizeof(*request) + extlen + keylen + dtalen);
-
-    memset(request, 0, sizeof(*request));
-    request->message.header.request.magic = PROTOCOL_BINARY_REQ;
-    request->message.header.request.opcode = cmd;
-    request->message.header.request.extlen = extlen;
-    request->message.header.request.keylen = htons(keylen);
-    request->message.header.request.bodylen = htonl(extlen + keylen + dtalen);
-    request->message.header.request.opaque = 0xdeadbeef;
-
-    off_t ext_offset = sizeof(protocol_binary_request_no_extras);
-    off_t key_offset = ext_offset + extlen;
-    off_t dta_offset = key_offset + keylen;
-
-    if (ext != NULL) {
-        memcpy(buf + ext_offset, ext, extlen);
-    }
-    if (key != NULL) {
-        memcpy(buf + key_offset, key, keylen);
-    }
-    if (dta != NULL) {
-        memcpy(buf + dta_offset, dta, dtalen);
-    }
-
-    return sizeof(*request) + extlen + keylen + dtalen;
-}
-
 static off_t raw_command(char* buf,
                          size_t bufsz,
                          uint8_t cmd,
@@ -1118,7 +780,26 @@ static off_t raw_command(char* buf,
                          const void* dta,
                          size_t dtalen) {
     /* all of the storage commands use the same command layout */
-    return ext_command(buf, bufsz, cmd, NULL, 0, key, keylen, dta, dtalen);
+    protocol_binary_request_no_extras *request = (void*)buf;
+    assert(bufsz > sizeof(*request) + keylen + dtalen);
+
+    memset(request, 0, sizeof(*request));
+    request->message.header.request.magic = PROTOCOL_BINARY_REQ;
+    request->message.header.request.opcode = cmd;
+    request->message.header.request.keylen = htons(keylen);
+    request->message.header.request.bodylen = htonl(keylen + dtalen);
+    request->message.header.request.opaque = 0xdeadbeef;
+
+    off_t key_offset = sizeof(protocol_binary_request_no_extras);
+
+    if (key != NULL) {
+        memcpy(buf + key_offset, key, keylen);
+    }
+    if (dta != NULL) {
+        memcpy(buf + key_offset + keylen, dta, dtalen);
+    }
+
+    return sizeof(*request) + keylen + dtalen;
 }
 
 static off_t flush_command(char* buf, size_t bufsz, uint8_t cmd, uint32_t exptime, bool use_extra) {
@@ -1267,8 +948,6 @@ static void validate_response_header(protocol_binary_response_no_extras *respons
 
         case PROTOCOL_BINARY_CMD_GET:
         case PROTOCOL_BINARY_CMD_GETQ:
-        case PROTOCOL_BINARY_CMD_GAT:
-        case PROTOCOL_BINARY_CMD_GATQ:
             assert(response->message.header.response.keylen == 0);
             assert(response->message.header.response.extlen == 4);
             assert(response->message.header.response.cas != 0);
@@ -1276,8 +955,6 @@ static void validate_response_header(protocol_binary_response_no_extras *respons
 
         case PROTOCOL_BINARY_CMD_GETK:
         case PROTOCOL_BINARY_CMD_GETKQ:
-        case PROTOCOL_BINARY_CMD_GATK:
-        case PROTOCOL_BINARY_CMD_GATKQ:
             assert(response->message.header.response.keylen != 0);
             assert(response->message.header.response.extlen == 4);
             assert(response->message.header.response.cas != 0);
@@ -1333,10 +1010,9 @@ static enum test_return test_binary_quit_impl(uint8_t cmd) {
     }
 
     /* Socket should be closed now, read should return 0 */
-    assert(con->read(con, buffer.bytes, sizeof(buffer.bytes)) == 0);
-    close_conn();
-    con = connect_server("127.0.0.1", port, false, enable_ssl);
-    assert(con);
+    assert(read(sock, buffer.bytes, sizeof(buffer.bytes)) == 0);
+    close(sock);
+    sock = connect_server("127.0.0.1", port, false);
 
     return TEST_PASS;
 }
@@ -1544,14 +1220,7 @@ static enum test_return test_binary_get_impl(const char *key, uint8_t cmd) {
         protocol_binary_response_no_extras response;
         char bytes[1024];
     } send, receive;
-
-    uint32_t expiration = htonl(3600);
-    size_t extlen = 0;
-    if (cmd == PROTOCOL_BINARY_CMD_GAT || cmd == PROTOCOL_BINARY_CMD_GATK)
-        extlen = sizeof(expiration);
-
-    size_t len = ext_command(send.bytes, sizeof(send.bytes), cmd,
-                             extlen ? &expiration : NULL, extlen,
+    size_t len = raw_command(send.bytes, sizeof(send.bytes), cmd,
                              key, strlen(key), NULL, 0);
 
     safe_send(send.bytes, len, false);
@@ -1576,9 +1245,8 @@ static enum test_return test_binary_get_impl(const char *key, uint8_t cmd) {
             protocol_binary_request_no_extras request;
             char bytes[1024];
         } temp;
-        size_t l = ext_command(temp.bytes, sizeof(temp.bytes), cmd,
-                               extlen ? &expiration : NULL, extlen,
-                               key, strlen(key), NULL, 0);
+        size_t l = raw_command(temp.bytes, sizeof(temp.bytes),
+                               cmd, key, strlen(key), NULL, 0);
         memcpy(send.bytes + len, temp.bytes, l);
         len += l;
     }
@@ -1601,14 +1269,6 @@ static enum test_return test_binary_getk(void) {
     return test_binary_get_impl("test_binary_getk", PROTOCOL_BINARY_CMD_GETK);
 }
 
-static enum test_return test_binary_gat(void) {
-    return test_binary_get_impl("test_binary_gat", PROTOCOL_BINARY_CMD_GAT);
-}
-
-static enum test_return test_binary_gatk(void) {
-    return test_binary_get_impl("test_binary_gatk", PROTOCOL_BINARY_CMD_GATK);
-}
-
 static enum test_return test_binary_getq_impl(const char *key, uint8_t cmd) {
     const char *missing = "test_binary_getq_missing";
     union {
@@ -1616,27 +1276,19 @@ static enum test_return test_binary_getq_impl(const char *key, uint8_t cmd) {
         protocol_binary_response_no_extras response;
         char bytes[1024];
     } send, temp, receive;
-
-    uint32_t expiration = htonl(3600);
-    size_t extlen = 0;
-    if (cmd == PROTOCOL_BINARY_CMD_GATQ || cmd == PROTOCOL_BINARY_CMD_GATKQ)
-        extlen = sizeof(expiration);
-
     size_t len = storage_command(send.bytes, sizeof(send.bytes),
                                  PROTOCOL_BINARY_CMD_ADD,
                                  key, strlen(key), NULL, 0,
                                  0, 0);
-    size_t len2 = ext_command(temp.bytes, sizeof(temp.bytes), cmd,
-                              extlen ? &expiration : NULL, extlen,
-                              missing, strlen(missing), NULL, 0);
+    size_t len2 = raw_command(temp.bytes, sizeof(temp.bytes), cmd,
+                             missing, strlen(missing), NULL, 0);
     /* I need to change the first opaque so that I can separate the two
      * return packets */
     temp.request.message.header.request.opaque = 0xfeedface;
     memcpy(send.bytes + len, temp.bytes, len2);
     len += len2;
 
-    len2 = ext_command(temp.bytes, sizeof(temp.bytes), cmd,
-                       extlen ? &expiration : NULL, extlen,
+    len2 = raw_command(temp.bytes, sizeof(temp.bytes), cmd,
                        key, strlen(key), NULL, 0);
     memcpy(send.bytes + len, temp.bytes, len2);
     len += len2;
@@ -1659,14 +1311,6 @@ static enum test_return test_binary_getq(void) {
 
 static enum test_return test_binary_getkq(void) {
     return test_binary_getq_impl("test_binary_getkq", PROTOCOL_BINARY_CMD_GETKQ);
-}
-
-static enum test_return test_binary_gatq(void) {
-    return test_binary_getq_impl("test_binary_gatq", PROTOCOL_BINARY_CMD_GATQ);
-}
-
-static enum test_return test_binary_gatkq(void) {
-    return test_binary_getq_impl("test_binary_gatkq", PROTOCOL_BINARY_CMD_GATKQ);
 }
 
 static enum test_return test_binary_incr_impl(const char* key, uint8_t cmd) {
@@ -2112,7 +1756,6 @@ static enum test_return test_binary_pipeline_hickup(void)
     if ((ret = pthread_create(&tid, NULL,
                               binary_hickup_recv_verification_thread, NULL)) != 0) {
         fprintf(stderr, "Can't create thread: %s\n", strerror(ret));
-        free(buffer);
         return TEST_FAIL;
     }
 
@@ -2136,9 +1779,9 @@ static enum test_return test_binary_pipeline_hickup(void)
 
 
 static enum test_return test_issue_101(void) {
-    enum { max = 2 };
+    const int max = 2;
     enum test_return ret = TEST_PASS;
-    struct conn *conns[max];
+    int fds[max];
     int ii = 0;
     pid_t child = 0;
 
@@ -2152,17 +1795,15 @@ static enum test_return test_issue_101(void) {
     server_pid = start_server(&port, false, 1000);
 
     for (ii = 0; ii < max; ++ii) {
-        conns[ii] = NULL;
-        conns[ii] = connect_server("127.0.0.1", port, true, enable_ssl);
-        assert(conns[ii]);
-        assert(conns[ii]->sock > 0);
+        fds[ii] = connect_server("127.0.0.1", port, true);
+        assert(fds[ii] > 0);
     }
 
     /* Send command on the connection until it blocks */
     for (ii = 0; ii < max; ++ii) {
         bool more = true;
         do {
-            ssize_t err = conns[ii]->write(conns[ii], command, cmdlen);
+            ssize_t err = write(fds[ii], command, cmdlen);
             if (err == -1) {
                 switch (errno) {
                 case EINTR:
@@ -2189,29 +1830,16 @@ static enum test_return test_issue_101(void) {
         assert(c == child);
         assert(stat == 0);
     } else {
-        con = connect_server("127.0.0.1", port, false, enable_ssl);
-        assert(con);
+        sock = connect_server("127.0.0.1", port, false);
         ret = test_binary_noop();
-        close_conn();
+        close(sock);
         exit(0);
     }
 
  cleanup:
     /* close all connections */
     for (ii = 0; ii < max; ++ii) {
-        struct conn *c = conns[ii];
-        if (c == NULL) continue;
-#ifdef TLS
-        if (c->ssl) {
-            SSL_shutdown(c->ssl);
-            SSL_free(c->ssl);
-        }
-        if (c->ssl_ctx)
-            SSL_CTX_free(c->ssl_ctx);
-#endif
-        if (c->sock > 0) close(c->sock);
-        free(conns[ii]);
-        conns[ii] = NULL;
+        close(fds[ii]);
     }
 
     assert(kill(server_pid, SIGTERM) == 0);
@@ -2232,11 +1860,6 @@ struct testcase testcases[] = {
     { "cache_destructor", cache_destructor_test },
     { "cache_reuse", cache_reuse_test },
     { "cache_redzone", cache_redzone_test },
-    { "stats_prefix_find", test_stats_prefix_find },
-    { "stats_prefix_record_get", test_stats_prefix_record_get },
-    { "stats_prefix_record_delete", test_stats_prefix_record_delete },
-    { "stats_prefix_record_set", test_stats_prefix_record_set },
-    { "stats_prefix_dump", test_stats_prefix_dump },
     { "issue_161", test_issue_161 },
     { "strtol", test_safe_strtol },
     { "strtoll", test_safe_strtoll },
@@ -2264,10 +1887,6 @@ struct testcase testcases[] = {
     { "binary_getq", test_binary_getq },
     { "binary_getk", test_binary_getk },
     { "binary_getkq", test_binary_getkq },
-    { "binary_gat", test_binary_gat },
-    { "binary_gatq", test_binary_gatq },
-    { "binary_gatk", test_binary_gatk },
-    { "binary_gatkq", test_binary_gatkq },
     { "binary_incr", test_binary_incr },
     { "binary_incrq", test_binary_incrq },
     { "binary_decr", test_binary_decr },
@@ -2282,33 +1901,14 @@ struct testcase testcases[] = {
     { "binary_stat", test_binary_stat },
     { "binary_illegal", test_binary_illegal },
     { "binary_pipeline_hickup", test_binary_pipeline_hickup },
-    { "shutdown", shutdown_memcached_server },
     { "stop_server", stop_memcached_server },
     { NULL, NULL }
 };
-
-/* Stub out function defined in memcached.c */
-void STATS_LOCK(void);
-void STATS_UNLOCK(void);
-void STATS_LOCK(void)
-{}
-void STATS_UNLOCK(void)
-{}
 
 int main(int argc, char **argv)
 {
     int exitcode = 0;
     int ii = 0, num_cases = 0;
-#ifdef TLS
-    if (getenv("SSL_TEST") != NULL) {
-        SSLeay_add_ssl_algorithms();
-        SSL_load_error_strings();
-        enable_ssl = true;
-    }
-#endif
-    /* Stats prefix test is sensitive to the choice of hash function */
-    hash_init(JENKINS_HASH);
-    stats_prefix_init(':');
 
     for (num_cases = 0; testcases[num_cases].description; num_cases++) {
         /* Just counting */

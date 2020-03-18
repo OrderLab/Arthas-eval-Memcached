@@ -5,20 +5,11 @@ our @files;
 
 BEGIN {
     chdir "$Bin/.." or die;
-    unless (-d "$Bin/../.git") {
-        use Test::More;
-        plan skip_all => "Skipping test because this does not appear to be a memcached git working directory";
-        exit 0;
-    }
 
-    my @exempted = qw(Makefile.am ChangeLog doc/Makefile.am README README.md compile_commands.json);
+    my @exempted = qw(Makefile.am ChangeLog doc/Makefile.am);
     push(@exempted, glob("doc/*.xml"));
-    push(@exempted, glob("doc/*.full"));
     push(@exempted, glob("doc/xml2rfc/*.xsl"));
-    push(@exempted, glob("doc/xml2rfc/*.dtd"));
     push(@exempted, glob("m4/*backport*m4"));
-    push(@exempted, glob("*.orig"));
-    push(@exempted, glob(".*.swp"));
     my %exempted_hash = map { $_ => 1 } @exempted;
 
     my @stuff = split /\0/, `git ls-files -z -c -m -o --exclude-standard`;
@@ -38,7 +29,7 @@ BEGIN {
 use Test::More tests => scalar(@files);
 
 foreach my $f (@files) {
-    open(my $fh, $f) or die "Cannot open file $f: $!";
+    open(my $fh, $f) or die;
     my $before = do { local $/; <$fh>; };
     close ($fh);
     my $after = $before;

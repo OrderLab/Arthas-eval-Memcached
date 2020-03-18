@@ -1,7 +1,7 @@
 #!/usr/bin/perl
 
 use strict;
-use Test::More tests => 21;
+use Test::More tests => 18;
 use FindBin qw($Bin);
 use lib "$Bin/lib";
 use MemcachedTest;
@@ -75,23 +75,8 @@ eval {
 };
 ok($@, "Died with illegal -B arg.");
 
-# Maximum connections must be greater than 0.
-eval {
-    my $server = new_memcached("-c 0");
-};
-ok($@, "Died with invalid maximum connections 0.");
-eval {
-    my $server = new_memcached("-c -1");
-};
-ok($@, "Died with invalid maximum connections -1.");
-
 # Should not allow -t 0
 eval {
     my $server = new_memcached("-t 0");
 };
 ok($@, "Died with illegal 0 thread count");
-
-{
-    my $exit_code = run_help();
-    is($exit_code, 0, "Help defaults are fine.");
-};

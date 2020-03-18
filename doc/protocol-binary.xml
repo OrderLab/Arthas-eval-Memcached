@@ -7,7 +7,7 @@
 <?rfc sortrefs="yes" ?>
 <?rfc compact="yes" ?>
 <?rfc subcompact="yes" ?>
-<rfc category="info" docName="draft-stone-memcache-binary-01" ipr="trust200902">
+<rfc category="info" docName="draft-stone-memcache-binary-01" ipr="none">
   <front>
     <title> Memcache Binary Protocol </title>
 
@@ -537,7 +537,7 @@ Key length   (2,3)  : 0x0005
 Extra length (4)    : 0x04
 Data type    (5)    : 0x00
 Status       (6,7)  : 0x0000
-Total body   (8-11) : 0x0000000E
+Total body   (8-11) : 0x00000009
 Opaque       (12-15): 0x00000000
 CAS          (16-23): 0x0000000000000001
 Extras              :
@@ -637,7 +637,7 @@ Value        (33-37): The textual string: "World"
     +---------------+---------------+---------------+---------------+
   24| 0xde          | 0xad          | 0xbe          | 0xef          |
     +---------------+---------------+---------------+---------------+
-  28| 0x00          | 0x00          | 0x1c          | 0x20          |
+  28| 0x00          | 0x00          | 0x0e          | 0x10          |
     +---------------+---------------+---------------+---------------+
   32| 0x48 ('H')    | 0x65 ('e')    | 0x6c ('l')    | 0x6c ('l')    |
     +---------------+---------------+---------------+---------------+
@@ -661,7 +661,7 @@ Opaque       (12-15): 0x00000000
 CAS          (16-23): 0x0000000000000000
 Extras              :
   Flags      (24-27): 0xdeadbeef
-  Expiry     (28-31): 0x00001c20
+  Expiry     (28-31): 0x00000e10
 Key          (32-36): The textual string "Hello"
 Value        (37-41): The textual string "World"
              </artwork>
@@ -879,7 +879,7 @@ Value               : None
     +---------------+---------------+---------------+---------------+
   36| 0x00          | 0x00          | 0x00          | 0x00          |
     +---------------+---------------+---------------+---------------+
-  40| 0x00          | 0x00          | 0x1c          | 0x20          |
+  40| 0x00          | 0x00          | 0x0e          | 0x10          |
     +---------------+---------------+---------------+---------------+
   44| 0x63 ('c')    | 0x6f ('o')    | 0x75 ('u')    | 0x6e ('n')    |
     +---------------+---------------+---------------+---------------+
@@ -900,7 +900,7 @@ CAS          (16-23): 0x0000000000000000
 Extras              :
   delta      (24-31): 0x0000000000000001
   initial    (32-39): 0x0000000000000000
-  expiration (40-43): 0x00001c20
+  exipration (40-43): 0x00000e10
 Key                 : Textual string "counter"
 Value               : None
               </artwork>
@@ -1068,7 +1068,7 @@ Value               : None
     +---------------+---------------+---------------+---------------+
   20| 0x00          | 0x00          | 0x00          | 0x00          |
     +---------------+---------------+---------------+---------------+
-  24| 0x00          | 0x00          | 0x1c          | 0x20          |
+  24| 0x00          | 0x00          | 0x0e          | 0x10          |
     +---------------+---------------+---------------+---------------+
     Total 28 bytes (24 byte header, 4 byte body)
 
@@ -1083,7 +1083,7 @@ Total body   (8-11) : 0x00000004
 Opaque       (12-15): 0x00000000
 CAS          (16-23): 0x0000000000000000
 Extras              :
-   Expiry    (24-27): 0x00001c20
+   Expiry    (24-27): 0x000e10
 Key                 : None
 Value               : None
           </artwork>
@@ -1402,7 +1402,7 @@ Status       (6,7)  : 0x0000
 Total body   (8-11) : 0x00000007
 Opaque       (12-15): 0x00000000
 CAS          (16-23): 0x0000000000000000
-Extras              : None
+Exstras             : None
 Key                 : The textual string "pid"
 Value               : The textual string "3078"
             </artwork>
@@ -1412,16 +1412,11 @@ Value               : The textual string "3078"
     </section>
     <section anchor="security" title="Security Considerations">
       <t>
-      Memcache has few authentication and no security layers whatsoever. It is
+      Memcache has no authentication or security layers whatsoever. It is
       RECOMMENDED that memcache be deployed strictly on closed, protected,
       back-end networks within a single data center, within a single cluster of
       servers, or even on a single host, providing shared caching for multiple
       applications. Memcache MUST NOT be made available on a public network.
-      </t>
-
-      <t>
-      SASL is supported as an authentication mechanism. See the wiki for more
-      information.
       </t>
     </section>
 
@@ -1441,7 +1436,7 @@ Value               : The textual string "3078"
           </abstract>
         </front>
       </reference>
-      <dwdrfc-ref anchor="KEYWORDS" src='reference.RFC.2119.xml'/>
+      <dwdrfc-ref anchor="KEYWORDS" src='http://xml.resource.org/public/rfc/bibxml/reference.RFC.2119.xml'/>
     </references>
 
     <section anchor="acknowledgments" title="Acknowledgments">

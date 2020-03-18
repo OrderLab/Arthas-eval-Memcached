@@ -1,14 +1,15 @@
 #ifndef HASH_H
 #define    HASH_H
 
-typedef uint32_t (*hash_func)(const void *key, size_t length);
-extern hash_func hash;
+#ifdef    __cplusplus
+extern "C" {
+#endif
 
-enum hashfunc_type {
-    JENKINS_HASH=0, MURMUR3_HASH
-};
+uint32_t hash(const void *key, size_t length, const uint32_t initval);
 
-int hash_init(enum hashfunc_type type);
+#ifdef    __cplusplus
+}
+#endif
 
 #endif    /* HASH_H */
 

@@ -3,6 +3,16 @@
 #define CACHE_H
 #include <pthread.h>
 
+#ifdef HAVE_UMEM_H
+#include <umem.h>
+#define cache_t umem_cache_t
+#define cache_alloc(a) umem_cache_alloc(a, UMEM_DEFAULT)
+#define cache_free(a, b) umem_cache_free(a, b)
+#define cache_create(a,b,c,d,e) umem_cache_create((char*)a, b, c, d, e, NULL, NULL, NULL, 0)
+#define cache_destroy(a) umem_cache_destroy(a);
+
+#else
+
 #ifndef NDEBUG
 /* may be used for debug purposes */
 extern int cache_error;
@@ -21,8 +31,9 @@ typedef int cache_constructor_t(void* obj, void* notused1, int notused2);
  * Destructor used to clean up allocated objects before they are
  * returned to the operating system.
  *
- * @param obj pointer to the object to clean up.
- * @param notused This parameter is currently not used.
+ * @param obj pointer to the object to initialized.
+ * @param notused1 This parameter is currently not used.
+ * @param notused2 This parameter is currently not used.
  * @return you should return 0, but currently this is not checked
  */
 typedef void cache_destructor_t(void* obj, void* notused);
@@ -43,12 +54,8 @@ typedef struct {
     size_t bufsize;
     /** The capacity of the list of elements */
     int freetotal;
-    /** Total malloc'ed objects */
-    int total;
     /** The current number of free elements */
     int freecurr;
-    /** A limit on the total number of elements */
-    int limit;
     /** The constructor to be called each time we allocate more memory */
     cache_constructor_t* constructor;
     /** The destructor to be called each time before we release memory */
@@ -60,7 +67,7 @@ typedef struct {
  *
  * The object cache will let you allocate objects of the same size. It is fully
  * MT safe, so you may allocate objects from multiple threads without having to
- * do any synchronization in the application code.
+ * do any syncrhonization in the application code.
  *
  * @param name the name of the object cache. This name may be used for debug purposes
  *             and may help you track down what kind of object you have problems with
@@ -94,7 +101,6 @@ void cache_destroy(cache_t* handle);
  *         the allocation cannot be satisfied.
  */
 void* cache_alloc(cache_t* handle);
-void* do_cache_alloc(cache_t* handle);
 /**
  * Return an object back to the cache.
  *
@@ -105,13 +111,6 @@ void* do_cache_alloc(cache_t* handle);
  * @param ptr pointer to the object to return.
  */
 void cache_free(cache_t* handle, void* ptr);
-void do_cache_free(cache_t* handle, void* ptr);
-/**
- * Set or adjust a limit for the number of objects to malloc
- *
- * @param handle handle to the object cache to adjust
- * @param limit the number of objects to cache before returning NULL
- */
-void cache_set_limit(cache_t* handle, int limit);
+#endif
 
 #endif

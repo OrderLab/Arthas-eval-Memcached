@@ -1,7 +1,3 @@
-2016-08-23
-    * ChangeLog moved from Google Code to Github Wiki, it's now available at:
-      https://github.com/memcached/memcached/wiki/ReleaseNotes
-
 2010-10-11
 	* ChangeLog is no longer being updated.
 	See http://code.google.com/p/memcached/wiki/ReleaseNotes
@@ -150,7 +146,7 @@
 2007-11-19  Dormando <dormando@rydia.net>
 
        * Patch series from Tomash Brechko <tomash.brechko@gmail.com>:
-         Minor fixes and optimizations.
+         Minor fixes and optimisations.
 
        * Patches from Chris, Dustin, and Dormando to fix CAS.
 
@@ -201,7 +197,7 @@
 	  Patch from Maxim Dounin <mdounin@mdounin.ru>
 
 2007-08-21 Paul Lindner <lindner@inuus.com>
-	* Incorporate increment patch from Evan Miller 
+	* Incorporate incrememnt patch from Evan Miller 
 	  <emiller@imvu.com> to define increment overflow
 	  behavior.
 
@@ -313,7 +309,7 @@
 	  uint8_t types.
 
 	* Major refactoring - move API calls for assoc/items/slabs to
-	  their own individual header files.  Add appropriate const and
+	  their own individual header files.  Add apropriate const and
 	  static declarations as appropriate.
 	
 	* Avoid type-punning.  Do a more efficient realloc inside the
@@ -408,7 +404,7 @@
 	  causing expiration times to not be processed correctly.
 
 2006-08-21
-	* Nathan Neulinger <nneul@umr.edu>: fix incompatibilities with
+	* Nathan Neulinger <nneul@umr.edu>: fix incompatabilities with
 	  unix domain socket support and the UDP code and clean up stale 
 	  sockets
 
@@ -419,7 +415,7 @@
 	* Steven Grimm <sgrimm@facebook.com>:  big bunch of changes:
 	  big CPU reduction work, UDP-based interface, increased memory
 	  efficiency.  (intertwined patch, committed all together)
-	  <https://lists.danga.com/pipermail/memcached/2006-May/002164.html>
+	  <http://lists.danga.com/pipermail/memcached/2006-May/002164.html>
 	  or see svn commit logs
 
 2006-04-30
