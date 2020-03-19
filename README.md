@@ -17,9 +17,7 @@ list to ask questions, github issues aren't seen by everyone!
 
 ## Dependencies
 
-* libevent, https://www.monkey.org/~provos/libevent/ (libevent-dev)
-* libseccomp, (optional, experimental, linux) - enables process restrictions for
-  better security. Tested only on x86_64 architectures.
+* libevent, http://www.monkey.org/~provos/libevent/ (libevent-dev)
 
 ## Environment
 
@@ -30,7 +28,7 @@ should never go to disk, or you've lost the whole point of it)
 
 ## Website
 
-* https://www.memcached.org
+* http://www.memcached.org
 
 ## Contributing
 

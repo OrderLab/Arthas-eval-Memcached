@@ -4,7 +4,7 @@ noinst_PROGRAMS = memcached-debug sizes testapp timedrun
 
 BUILT_SOURCES=
 
-testapp_SOURCES = testapp.c util.c util.h stats_prefix.c stats_prefix.h jenkins_hash.c murmur3_hash.c hash.c hash.h cache.c
+testapp_SOURCES = testapp.c util.c util.h
 
 timedrun_SOURCES = timedrun.c
 
@@ -16,46 +16,25 @@ memcached_SOURCES = memcached.c memcached.h \
                     items.c items.h \
                     assoc.c assoc.h \
                     thread.c daemon.c \
-                    stats_prefix.c stats_prefix.h \
+                    stats.c stats.h \
                     util.c util.h \
-                    trace.h cache.c cache.h sasl_defs.h \
+                    trace.h cache.h sasl_defs.h \
                     bipbuffer.c bipbuffer.h \
                     logger.c logger.h \
                     crawler.c crawler.h \
-                    itoa_ljust.c itoa_ljust.h \
-                    slab_automove.c slab_automove.h \
-                    authfile.c authfile.h \
-                    restart.c restart.h
+                    itoa_ljust.c itoa_ljust.h
+
+if BUILD_CACHE
+memcached_SOURCES += cache.c
+testapp_SOURCES += cache.c
+endif
 
 if BUILD_SOLARIS_PRIVS
 memcached_SOURCES += solaris_priv.c
 endif
 
-if BUILD_LINUX_PRIVS
-memcached_SOURCES += linux_priv.c
-endif
-
-if BUILD_OPENBSD_PRIVS
-memcached_SOURCES += openbsd_priv.c
-endif
-
-if BUILD_FREEBSD_PRIVS
-memcached_SOURCES += freebsd_priv.c
-endif
-
 if ENABLE_SASL
 memcached_SOURCES += sasl_defs.c
-endif
-
-if ENABLE_EXTSTORE
-memcached_SOURCES += extstore.c extstore.h \
-                     crc32c.c crc32c.h \
-                     storage.c storage.h \
-                     slab_automove_extstore.c slab_automove_extstore.h
-endif
-
-if ENABLE_TLS
-memcached_SOURCES += tls.c tls.h
 endif
 
 memcached_debug_SOURCES = $(memcached_SOURCES)
@@ -67,11 +46,6 @@ memcached_LDADD =
 memcached_DEPENDENCIES =
 memcached_debug_DEPENDENCIES =
 CLEANFILES=
-
-if BUILD_LINUX_PRIVS
-memcached_LDADD += -lseccomp
-memcached_debug_LDADD += -lseccomp
-endif
 
 if BUILD_DTRACE
 BUILT_SOURCES += memcached_dtrace.h
@@ -85,8 +59,6 @@ memcached_debug_LDADD += memcached_debug_dtrace.o
 memcached_debug_DEPENDENCIES += memcached_debug_dtrace.o
 CLEANFILES += memcached_dtrace.o memcached_debug_dtrace.o
 endif
-
-memcached_debug_CFLAGS += -DMEMCACHED_DEBUG
 
 memcached_dtrace.h: memcached_dtrace.d
 	${DTRACE} -h -s memcached_dtrace.d
@@ -107,34 +79,10 @@ EXTRA_DIST = doc scripts t memcached.spec memcached_dtrace.d version.m4 README.m
 
 MOSTLYCLEANFILES = *.gcov *.gcno *.gcda *.tcov
 
-if ENABLE_TLS
-test_tls:
-	$(MAKE) SSL_TEST=1 test
-
-test_basic_tls:
-	@if test $(SSL_TEST)1 != 1; then \
-	  echo "Running basic tests with TLS"; \
-	  $(builddir)/testapp; \
-	  prove $(srcdir)/t/binary.t $(srcdir)/t/getset.t $(srcdir)/t/ssl*; \
-	  echo "Finished running basic TLS tests"; \
-	else \
-	  echo "Set SSL_TEST=1 to enable TLS tests"; \
-	fi
-endif
-
 test:	memcached-debug sizes testapp
-	$(builddir)/sizes
-	$(builddir)/testapp
-if ENABLE_TLS
-	@if test $(SSL_TEST)1 = 1; then \
-          $(MAKE) SSL_TEST=1  test_basic_tls; \
-	fi
-endif
-	@if test -n "${PARALLEL}"; then \
-	  prove $(srcdir)/t -j ${PARALLEL}; \
-	else \
-	  prove $(srcdir)/t; \
-	fi
+	$(srcdir)/sizes
+	$(srcdir)/testapp
+	prove $(srcdir)/t
 	@if test `basename $(PROFILER)` = "gcov"; then \
 	  for file in memcached_debug-*.gc??; do \
 	    mv -f $$file `echo $$file | sed 's/memcached_debug-//'`; \

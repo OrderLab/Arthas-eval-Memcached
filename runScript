@@ -1,0 +1,2 @@
+#!/bin/bash
+sudo ./memcached -p 11211 -U 11211 -u root -d -vv 1

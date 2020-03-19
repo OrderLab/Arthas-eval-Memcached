@@ -6,7 +6,7 @@ use FindBin qw($Bin);
 use lib "$Bin/lib";
 use MemcachedTest;
 
-my $server = new_memcached("-o no_lru_crawler,no_lru_maintainer");
+my $server = new_memcached();
 my $sock = $server->sock;
 
 
@@ -18,20 +18,13 @@ my $sock = $server->sock;
 ## STAT version 1.4.3
 ## STAT libevent 1.4.13-stable.
 ## see doc/protocol.txt for others
-# note that auth stats are tested in auth specific tests
+# note that auth stats are tested in auth specfic tests
 
 
 my $stats = mem_stats($sock);
 
 # Test number of keys
-if (MemcachedTest::enabled_tls_testing()) {
-    # when TLS is enabled, stats contains additional keys:
-    #   - ssl_handshake_errors
-    #   - time_since_server_cert_refresh
-    is(scalar(keys(%$stats)), 80, "expected count of stats values");
-} else {
-    is(scalar(keys(%$stats)), 78, "expected count of stats values");
-}
+is(scalar(keys(%$stats)), 59, "59 stats values");
 
 # Test initial state
 foreach my $key (qw(curr_items total_items bytes cmd_get cmd_set get_hits evictions get_misses get_expired
@@ -137,13 +130,7 @@ is('z', $v, 'got the expected value');
 
 my $settings = mem_stats($sock, ' settings');
 is(1024, $settings->{'maxconns'});
-# we run SSL tests over TCP; hence the domain_socket
-# is expected to be NULL.
-if (enabled_tls_testing()) {
-    is('NULL', $settings->{'domain_socket'});
-} else {
-    isnt('NULL', $settings->{'domain_socket'});
-}
+is('NULL', $settings->{'domain_socket'});
 is('on', $settings->{'evictions'});
 is('yes', $settings->{'cas_enabled'});
 is('no', $settings->{'auth_enabled_sasl'});

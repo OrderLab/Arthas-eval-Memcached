@@ -7,30 +7,13 @@
 
 char my_sasl_hostname[1025];
 
-#if defined(HAVE_SASL_CB_GETCONF) || defined(HAVE_SASL_CB_GETCONFPATH)
+#ifdef HAVE_SASL_CB_GETCONF
 /* The locations we may search for a SASL config file if the user didn't
  * specify one in the environment variable SASL_CONF_PATH
  */
 const char * const locations[] = {
     "/etc/sasl/memcached.conf",
     "/etc/sasl2/memcached.conf",
-    NULL
-};
-
-/* If the element of locations is file, locations_dir_path stores the
- * directory path of these elements */
-const char *const locations_dir_path[] = {
-    "/etc/sasl",
-    "/etc/sasl2",
-    NULL
-};
-
-/* If the element of locations is directory, locations_file_path stores
- * the actual configure file which used by sasl, when GETCONFPATH is
- * enabled */
-const char *const locations_file_path[] = {
-    "/etc/sasl/memcached.conf/memcached.conf",
-    "/etc/sasl2/memcached.conf/memcached.conf",
     NULL
 };
 #endif
@@ -99,30 +82,18 @@ static int sasl_server_userdb_checkpass(sasl_conn_t *conn,
 }
 #endif
 
-#if defined(HAVE_SASL_CB_GETCONF) || defined(HAVE_SASL_CB_GETCONFPATH)
+#ifdef HAVE_SASL_CB_GETCONF
 static int sasl_getconf(void *context, const char **path)
 {
     *path = getenv("SASL_CONF_PATH");
 
     if (*path == NULL) {
-#if defined(HAVE_SASL_CB_GETCONF)
         for (int i = 0; locations[i] != NULL; ++i) {
             if (access(locations[i], F_OK) == 0) {
                 *path = locations[i];
                 break;
             }
         }
-#elif defined(HAVE_SASL_CB_GETCONFPATH)
-        for (int i = 0; locations[i] != NULL; ++i) {
-            if (access(locations_file_path[i], F_OK) == 0) {
-                *path = locations[i];
-                break;
-            } else if (access(locations[i], F_OK) == 0) {
-                *path = locations_dir_path[i];
-                break;
-            }
-        }
-#endif
     }
 
     if (settings.verbose) {
@@ -181,10 +152,6 @@ static sasl_callback_t sasl_callbacks[] = {
 
 #ifdef HAVE_SASL_CB_GETCONF
    { SASL_CB_GETCONF, sasl_getconf, NULL },
-#else
-#ifdef HAVE_SASL_CB_GETCONFPATH
-   { SASL_CB_GETCONFPATH, (sasl_callback_ft)sasl_getconf, NULL },
-#endif
 #endif
 
    { SASL_CB_LIST_END, NULL, NULL }

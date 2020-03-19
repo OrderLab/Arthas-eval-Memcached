@@ -5,7 +5,7 @@ use strict;
 use warnings;
 use Socket qw/SO_RCVBUF/;
 
-use Test::More tests => 12;
+use Test::More tests => 8;
 use FindBin qw($Bin);
 use lib "$Bin/lib";
 use MemcachedTest;
@@ -53,25 +53,6 @@ while (my $log = <$watcher>) {
 $res = <$watcher>;
 like($res, qr/ts=\d+\.\d+\ gid=\d+ type=item_get/, "saw a real log line after a skip");
 
-# testing the longest uri encoded key length
-{
-my $new_watcher = $server->new_sock;
-print $new_watcher "watch mutations\n";
-my $watch_res = <$new_watcher>;
-my $key = "";
-my $max_keylen = 250;
-for (1 .. $max_keylen) { $key .= "#"; }
-print $client "set $key 0 0 9\r\nmemcached\r\n";
-$res = <$client>;
-is ($res, "STORED\r\n", "stored the long key");
-if ($res eq "STORED\r\n") {
-    $watch_res = <$new_watcher>;
-    my $max_uri_keylen = $max_keylen * 3 + length("key=");
-    my @tab = split(/\s+/, $watch_res);
-    is (length($tab[3]), $max_uri_keylen, "got the correct uri encoded key length");;
-}
-}
-
 # test combined logs
 # fill to evictions, then enable watcher, set again, and look for both lines
 
@@ -102,44 +83,4 @@ if ($res eq "STORED\r\n") {
     }
     is($found_log, 1, "found rawcmd log entry");
     is($found_ev, 1, "found eviction log entry");
-}
-
-# test cas command logs
-# TODO: need to expose active watchers in stats, so we can monitor for when
-# the previous ones are fully disconnected. They might be swallowing the logs
-# before we get them. Since I can't reproduce this locally and travis takes 30
-# minutes to fail I can't instrument this.
-SKIP: {
-    skip "Mysteriously fails on travis CI.", 1;
-    $watcher = $server->new_sock;
-    print $watcher "watch mutations\n";
-    $res = <$watcher>;
-    is($res, "OK\r\n", "mutations watcher enabled");
-
-    # There's a bit of a startup race where some workers may not have the log
-    # enabled yet, so we try a little harder to get the log line in there.
-    sleep 1;
-    for (1 .. 20) {
-        print $client "cas cas_watch_key 0 0 5 0\r\nvalue\r\n";
-        $res = <$client>;
-    }
-    my $tries = 30;
-    my $found_cas = 0;
-    while (my $log = <$watcher>) {
-        $found_cas = 1 if ($log =~ m/cmd=cas/ && $log =~ m/cas_watch_key/);
-        last if ($tries-- == 0 || $found_cas);
-    }
-    is($found_cas, 1, "correctly logged cas command");
-}
-
-# test no_watch option
-{
-    my $nowatch_server = new_memcached('-W');
-    my $watchsock = $nowatch_server->new_sock;
-
-    print $watchsock "watch mutations\n";
-
-    my $watchresult = <$watchsock>;
-
-    is($watchresult, "CLIENT_ERROR watch commands not allowed\r\n", "attempted watch gave client error with no_watch option set");
 }

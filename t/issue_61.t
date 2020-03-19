@@ -17,4 +17,4 @@ is (scalar <$sock>, "STORED\r\n", "stored foobar");
 is (scalar <$sock>, "STORED\r\n", "stored foobar");
 is (scalar <$sock>, "STORED\r\n", "stored foobar");
 my $stats = mem_stats($sock);
-cmp_ok ($stats->{"conn_yields"}, ">=", "5", "Got a decent number of yields");
+is ($stats->{"conn_yields"}, "5", "Got a decent number of yields");

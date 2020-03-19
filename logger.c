@@ -6,7 +6,6 @@
 #include <errno.h>
 #include <poll.h>
 #include <ctype.h>
-#include <stdarg.h>
 
 #if defined(__sun)
 #include <atomic.h>
@@ -51,32 +50,8 @@ static const entry_details default_entries[] = {
     [LOGGER_ITEM_GET] = {LOGGER_ITEM_GET_ENTRY, 512, LOG_FETCHERS, NULL},
     [LOGGER_ITEM_STORE] = {LOGGER_ITEM_STORE_ENTRY, 512, LOG_MUTATIONS, NULL},
     [LOGGER_CRAWLER_STATUS] = {LOGGER_TEXT_ENTRY, 512, LOG_SYSEVENTS,
-        "type=lru_crawler crawler=%d lru=%s low_mark=%llu next_reclaims=%llu since_run=%u next_run=%d elapsed=%u examined=%llu reclaimed=%llu"
-    },
-    [LOGGER_SLAB_MOVE] = {LOGGER_TEXT_ENTRY, 512, LOG_SYSEVENTS,
-        "type=slab_move src=%d dst=%d"
-    },
-#ifdef EXTSTORE
-    [LOGGER_EXTSTORE_WRITE] = {LOGGER_EXT_WRITE_ENTRY, 512, LOG_EVICTIONS, NULL},
-    [LOGGER_COMPACT_START] = {LOGGER_TEXT_ENTRY, 512, LOG_SYSEVENTS,
-        "type=compact_start id=%lu version=%llu"
-    },
-    [LOGGER_COMPACT_ABORT] = {LOGGER_TEXT_ENTRY, 512, LOG_SYSEVENTS,
-        "type=compact_abort id=%lu"
-    },
-    [LOGGER_COMPACT_READ_START] = {LOGGER_TEXT_ENTRY, 512, LOG_SYSEVENTS,
-        "type=compact_read_start id=%lu offset=%llu"
-    },
-    [LOGGER_COMPACT_READ_END] = {LOGGER_TEXT_ENTRY, 512, LOG_SYSEVENTS,
-        "type=compact_read_end id=%lu offset=%llu rescues=%lu lost=%lu skipped=%lu"
-    },
-    [LOGGER_COMPACT_END] = {LOGGER_TEXT_ENTRY, 512, LOG_SYSEVENTS,
-        "type=compact_end id=%lu"
-    },
-    [LOGGER_COMPACT_FRAGINFO] = {LOGGER_TEXT_ENTRY, 512, LOG_SYSEVENTS,
-        "type=compact_fraginfo ratio=%.2f bytes=%lu"
-    },
-#endif
+        "type=lru_crawler crawler=%d low_mark=%llu next_reclaims=%llu since_run=%u next_run=%d elapsed=%u examined=%llu reclaimed=%llu"
+    }
 };
 
 #define WATCHER_ALL -1
@@ -88,8 +63,8 @@ static int logger_thread_poll_watchers(int force_poll, int watcher);
 
 /* Logger GID's can be used by watchers to put logs back into strict order
  */
-static uint64_t logger_gid = 0;
-uint64_t logger_get_gid(void) {
+static uint64_t logger_get_gid(void) {
+    static uint64_t logger_gid = 0;
 #ifdef HAVE_GCC_64ATOMICS
     return __sync_add_and_fetch(&logger_gid, 1);
 #elif defined(__sun)
@@ -99,18 +74,6 @@ uint64_t logger_get_gid(void) {
     uint64_t res = ++logger_gid;
     mutex_unlock(&logger_atomics_mutex);
     return res;
-#endif
-}
-
-void logger_set_gid(uint64_t gid) {
-#ifdef HAVE_GCC_64ATOMICS
-    __sync_add_and_fetch(&logger_gid, gid);
-#elif defined(__sun)
-    atomic_add_64(&logger_gid);
-#else
-    mutex_lock(&logger_atomics_mutex);
-    logger_gid = gid;
-    mutex_unlock(&logger_atomics_mutex);
 #endif
 }
 
@@ -186,44 +149,44 @@ static void logger_set_flags(void) {
 static int _logger_thread_parse_ise(logentry *e, char *scratch) {
     int total;
     const char *cmd = "na";
-    char keybuf[KEY_MAX_URI_ENCODED_LENGTH];
+    char keybuf[KEY_MAX_LENGTH * 3 + 1];
     struct logentry_item_store *le = (struct logentry_item_store *) e->data;
     const char * const status_map[] = {
         "not_stored", "stored", "exists", "not_found", "too_large", "no_memory" };
     const char * const cmd_map[] = {
         "null", "add", "set", "replace", "append", "prepend", "cas" };
 
-    if (le->cmd <= 6)
+    if (le->cmd <= 5)
         cmd = cmd_map[le->cmd];
 
-    uriencode(le->key, keybuf, le->nkey, KEY_MAX_URI_ENCODED_LENGTH);
+    uriencode(le->key, keybuf, le->nkey, LOGGER_PARSE_SCRATCH);
     total = snprintf(scratch, LOGGER_PARSE_SCRATCH,
-            "ts=%d.%d gid=%llu type=item_store key=%s status=%s cmd=%s ttl=%u clsid=%u cfd=%d\n",
+            "ts=%d.%d gid=%llu type=item_store key=%s status=%s cmd=%s ttl=%u clsid=%u\n",
             (int)e->tv.tv_sec, (int)e->tv.tv_usec, (unsigned long long) e->gid,
-            keybuf, status_map[le->status], cmd, le->ttl, le->clsid, le->sfd);
+            keybuf, status_map[le->status], cmd, le->ttl, le->clsid);
     return total;
 }
 
 static int _logger_thread_parse_ige(logentry *e, char *scratch) {
     int total;
     struct logentry_item_get *le = (struct logentry_item_get *) e->data;
-    char keybuf[KEY_MAX_URI_ENCODED_LENGTH];
+    char keybuf[KEY_MAX_LENGTH * 3 + 1];
     const char * const was_found_map[] = {
         "not_found", "found", "flushed", "expired" };
 
-    uriencode(le->key, keybuf, le->nkey, KEY_MAX_URI_ENCODED_LENGTH);
+    uriencode(le->key, keybuf, le->nkey, LOGGER_PARSE_SCRATCH);
     total = snprintf(scratch, LOGGER_PARSE_SCRATCH,
-            "ts=%d.%d gid=%llu type=item_get key=%s status=%s clsid=%u cfd=%d\n",
+            "ts=%d.%d gid=%llu type=item_get key=%s status=%s clsid=%u\n",
             (int)e->tv.tv_sec, (int)e->tv.tv_usec, (unsigned long long) e->gid,
-            keybuf, was_found_map[le->was_found], le->clsid, le->sfd);
+            keybuf, was_found_map[le->was_found], le->clsid);
     return total;
 }
 
 static int _logger_thread_parse_ee(logentry *e, char *scratch) {
     int total;
-    char keybuf[KEY_MAX_URI_ENCODED_LENGTH];
+    char keybuf[KEY_MAX_LENGTH * 3 + 1];
     struct logentry_eviction *le = (struct logentry_eviction *) e->data;
-    uriencode(le->key, keybuf, le->nkey, KEY_MAX_URI_ENCODED_LENGTH);
+    uriencode(le->key, keybuf, le->nkey, LOGGER_PARSE_SCRATCH);
     total = snprintf(scratch, LOGGER_PARSE_SCRATCH,
             "ts=%d.%d gid=%llu type=eviction key=%s fetch=%s ttl=%lld la=%d clsid=%u\n",
             (int)e->tv.tv_sec, (int)e->tv.tv_usec, (unsigned long long) e->gid,
@@ -232,21 +195,7 @@ static int _logger_thread_parse_ee(logentry *e, char *scratch) {
 
     return total;
 }
-#ifdef EXTSTORE
-static int _logger_thread_parse_extw(logentry *e, char *scratch) {
-    int total;
-    char keybuf[KEY_MAX_URI_ENCODED_LENGTH];
-    struct logentry_ext_write *le = (struct logentry_ext_write *) e->data;
-    uriencode(le->key, keybuf, le->nkey, KEY_MAX_URI_ENCODED_LENGTH);
-    total = snprintf(scratch, LOGGER_PARSE_SCRATCH,
-            "ts=%d.%d gid=%llu type=extwrite key=%s fetch=%s ttl=%lld la=%d clsid=%u bucket=%u\n",
-            (int)e->tv.tv_sec, (int)e->tv.tv_usec, (unsigned long long) e->gid,
-            keybuf, (le->it_flags & ITEM_FETCHED) ? "yes" : "no",
-            (long long int)le->exptime, le->latime, le->clsid, le->bucket);
 
-    return total;
-}
-#endif
 /* Completes rendering of log line. */
 static enum logger_parse_entry_ret logger_thread_parse_entry(logentry *e, struct logger_stats *ls,
         char *scratch, int *scratch_len) {
@@ -261,11 +210,6 @@ static enum logger_parse_entry_ret logger_thread_parse_entry(logentry *e, struct
         case LOGGER_EVICTION_ENTRY:
             total = _logger_thread_parse_ee(e, scratch);
             break;
-#ifdef EXTSTORE
-        case LOGGER_EXT_WRITE_ENTRY:
-            total = _logger_thread_parse_extw(e, scratch);
-            break;
-#endif
         case LOGGER_ITEM_GET_ENTRY:
             total = _logger_thread_parse_ige(e, scratch);
             break;
@@ -376,7 +320,7 @@ static int logger_thread_read(logger *l, struct logger_stats *ls) {
         } else {
             logger_thread_write_entry(e, ls, scratch, scratch_len);
         }
-        pos += sizeof(logentry) + e->size + e->pad;
+        pos += sizeof(logentry) + e->size;
     }
     assert(pos <= size);
 
@@ -456,7 +400,7 @@ static int logger_thread_poll_watchers(int force_poll, int watcher) {
          */
         if (watchers_pollfds[nfd].revents & POLLIN) {
             char buf[1];
-            int res = ((conn*)w->c)->read(w->c, buf, 1);
+            int res = read(w->sfd, buf, 1);
             if (res == 0 || (res == -1 && (errno != EAGAIN && errno != EWOULDBLOCK))) {
                 L_DEBUG("LOGGER: watcher closed remotely\n");
                 logger_thread_close_watcher(w);
@@ -477,7 +421,7 @@ static int logger_thread_poll_watchers(int force_poll, int watcher) {
                         total = fwrite(data, 1, data_size, stderr);
                         break;
                     case LOGGER_WATCHER_CLIENT:
-                        total = ((conn*)w->c)->write(w->c, data, data_size);
+                        total = write(w->sfd, data, data_size);
                         break;
                 }
 
@@ -510,23 +454,19 @@ static void logger_thread_sum_stats(struct logger_stats *ls) {
     STATS_UNLOCK();
 }
 
-#define MAX_LOGGER_SLEEP 1000000
-#define MIN_LOGGER_SLEEP 1000
+#define MAX_LOGGER_SLEEP 100000
+#define MIN_LOGGER_SLEEP 0
 
 /* Primary logger thread routine */
 static void *logger_thread(void *arg) {
     useconds_t to_sleep = MIN_LOGGER_SLEEP;
     L_DEBUG("LOGGER: Starting logger thread\n");
-    // TODO: If we ever have item references in the logger code, will need to
-    // ensure everything is dequeued before stopping the thread.
     while (do_run_logger_thread) {
         int found_logs = 0;
         logger *l;
         struct logger_stats ls;
         memset(&ls, 0, sizeof(struct logger_stats));
-
-        /* only sleep if we're *above* the minimum */
-        if (to_sleep > MIN_LOGGER_SLEEP)
+        if (to_sleep)
             usleep(to_sleep);
 
         /* Call function to iterate each logger. */
@@ -542,12 +482,10 @@ static void *logger_thread(void *arg) {
         /* TODO: abstract into a function and share with lru_crawler */
         if (!found_logs) {
             if (to_sleep < MAX_LOGGER_SLEEP)
-                to_sleep += to_sleep / 8;
-            if (to_sleep > MAX_LOGGER_SLEEP)
-                to_sleep = MAX_LOGGER_SLEEP;
+                to_sleep += 50;
         } else {
             to_sleep /= 2;
-            if (to_sleep < MIN_LOGGER_SLEEP)
+            if (to_sleep < 50)
                 to_sleep = MIN_LOGGER_SLEEP;
         }
         logger_thread_sum_stats(&ls);
@@ -567,11 +505,12 @@ static int start_logger_thread(void) {
     return 0;
 }
 
-static int stop_logger_thread(void) {
+// future.
+/*static int stop_logger_thread(void) {
     do_run_logger_thread = 0;
     pthread_join(logger_tid, NULL);
     return 0;
-}
+}*/
 
 /*************************
  * Public functions for submitting logs and starting loggers from workers.
@@ -591,14 +530,17 @@ void logger_init(void) {
         abort();
     }
 
+    /* This can be removed once the global stats initializer is improved */
+    STATS_LOCK();
+    stats.log_worker_dropped = 0;
+    stats.log_worker_written = 0;
+    stats.log_watcher_skipped = 0;
+    stats.log_watcher_sent = 0;
+    STATS_UNLOCK();
     /* This is what adding a STDERR watcher looks like. should replace old
      * "verbose" settings. */
     //logger_add_watcher(NULL, 0);
     return;
-}
-
-void logger_stop(void) {
-    stop_logger_thread();
 }
 
 /* called *from* the thread using a logger.
@@ -639,41 +581,25 @@ static void _logger_log_evictions(logentry *e, item *it) {
     memcpy(le->key, ITEM_key(it), it->nkey);
     e->size = sizeof(struct logentry_eviction) + le->nkey;
 }
-#ifdef EXTSTORE
-/* TODO: When more logging endpoints are done and the extstore API has matured
- * more, this could be merged with above and print different types of
- * expulsion events.
- */
-static void _logger_log_ext_write(logentry *e, item *it, uint8_t bucket) {
-    struct logentry_ext_write *le = (struct logentry_ext_write *) e->data;
-    le->exptime = (it->exptime > 0) ? (long long int)(it->exptime - current_time) : (long long int) -1;
-    le->latime = current_time - it->time;
-    le->it_flags = it->it_flags;
-    le->nkey = it->nkey;
-    le->clsid = ITEM_clsid(it);
-    le->bucket = bucket;
-    memcpy(le->key, ITEM_key(it), it->nkey);
-    e->size = sizeof(struct logentry_ext_write) + le->nkey;
-}
-#endif
+
 /* 0 == nf, 1 == found. 2 == flushed. 3 == expired.
  * might be useful to store/print the flags an item has?
  * could also collapse this and above code into an "item status" struct. wait
  * for more endpoints to be written before making it generic, though.
+ * TODO: This and below should track and reprint the client fd.
  */
 static void _logger_log_item_get(logentry *e, const int was_found, const char *key,
-        const int nkey, const uint8_t clsid, const int sfd) {
+        const int nkey, const uint8_t clsid) {
     struct logentry_item_get *le = (struct logentry_item_get *) e->data;
     le->was_found = was_found;
     le->nkey = nkey;
     le->clsid = clsid;
     memcpy(le->key, key, nkey);
-    le->sfd = sfd;
     e->size = sizeof(struct logentry_item_get) + nkey;
 }
 
 static void _logger_log_item_store(logentry *e, const enum store_item_type status,
-        const int comm, char *key, const int nkey, rel_time_t ttl, const uint8_t clsid, int sfd) {
+        const int comm, char *key, const int nkey, rel_time_t ttl, const uint8_t clsid) {
     struct logentry_item_store *le = (struct logentry_item_store *) e->data;
     le->status = status;
     le->cmd = comm;
@@ -685,7 +611,6 @@ static void _logger_log_item_store(logentry *e, const enum store_item_type statu
         le->ttl = 0;
     }
     memcpy(le->key, key, nkey);
-    le->sfd = sfd;
     e->size = sizeof(struct logentry_item_store) + nkey;
 }
 
@@ -711,9 +636,8 @@ enum logger_ret_type logger_log(logger *l, const enum log_entry_type event, cons
         l->dropped++;
         return LOGGER_RET_NOSPACE;
     }
-    e->event = d->subtype;
-    e->pad = 0;
     e->gid = logger_get_gid();
+    e->event = d->subtype;
     /* TODO: Could pass this down as an argument now that we're using
      * LOGGER_LOG() macro.
      */
@@ -738,22 +662,13 @@ enum logger_ret_type logger_log(logger *l, const enum log_entry_type event, cons
         case LOGGER_EVICTION_ENTRY:
             _logger_log_evictions(e, (item *)entry);
             break;
-#ifdef EXTSTORE
-        case LOGGER_EXT_WRITE_ENTRY:
-            va_start(ap, entry);
-            int ew_bucket = va_arg(ap, int);
-            va_end(ap);
-            _logger_log_ext_write(e, (item *)entry, ew_bucket);
-            break;
-#endif
         case LOGGER_ITEM_GET_ENTRY:
             va_start(ap, entry);
             int was_found = va_arg(ap, int);
             char *key = va_arg(ap, char *);
             size_t nkey = va_arg(ap, size_t);
             uint8_t gclsid = va_arg(ap, int);
-            int gsfd = va_arg(ap, int);
-            _logger_log_item_get(e, was_found, key, nkey, gclsid, gsfd);
+            _logger_log_item_get(e, was_found, key, nkey, gclsid);
             va_end(ap);
             break;
         case LOGGER_ITEM_STORE_ENTRY:
@@ -764,21 +679,12 @@ enum logger_ret_type logger_log(logger *l, const enum log_entry_type event, cons
             size_t snkey = va_arg(ap, size_t);
             rel_time_t sttl = va_arg(ap, rel_time_t);
             uint8_t sclsid = va_arg(ap, int);
-            int ssfd = va_arg(ap, int);
-            _logger_log_item_store(e, status, comm, skey, snkey, sttl, sclsid, ssfd);
-            va_end(ap);
+            _logger_log_item_store(e, status, comm, skey, snkey, sttl, sclsid);
             break;
     }
 
-#ifdef NEED_ALIGN
-    /* Need to ensure *next* request is aligned. */
-    if (sizeof(logentry) + e->size % 8 != 0) {
-        e->pad = 8 - (sizeof(logentry) + e->size % 8);
-    }
-#endif
-
     /* Push pointer forward by the actual amount required */
-    if (bipbuf_push(buf, (sizeof(logentry) + e->size + e->pad)) == 0) {
+    if (bipbuf_push(buf, (sizeof(logentry) + e->size)) == 0) {
         fprintf(stderr, "LOGGER: Failed to bipbuf push a text entry\n");
         pthread_mutex_unlock(&l->mutex);
         return LOGGER_RET_ERR;
@@ -805,11 +711,10 @@ enum logger_add_watcher_ret logger_add_watcher(void *c, const int sfd, uint16_t 
     logger_watcher *w = NULL;
     pthread_mutex_lock(&logger_stack_lock);
     if (watcher_count >= WATCHER_LIMIT) {
-        pthread_mutex_unlock(&logger_stack_lock);
         return LOGGER_ADD_WATCHER_TOO_MANY;
     }
 
-    for (x = 0; x < WATCHER_LIMIT-1; x++) {
+    for (x = 0; x < WATCHER_LIMIT; x++) {
         if (watchers[x] == NULL)
             break;
     }

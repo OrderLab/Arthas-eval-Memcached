@@ -1,33 +1,23 @@
 man_MANS = memcached.1
 
-SPECIFICATIONS = protocol-binary.txt protocol-binary-range.txt
+EXTRA_DIST = *.txt
 
-EXTRA_DIST = $(srcdir)/*.txt
+BUILT_SOURCES=
 
-# When we make dist always include the generated specifications so people don't
-# have to have xml2rfc and xsltproc installed
-EXTRA_DIST += $(SPECIFICATIONS)
-
-BUILT_SOURCES =
-MOSTLYCLEANFILES =
 if BUILD_SPECIFICATIONS
-BUILT_SOURCES    += $(SPECIFICATIONS)
-MOSTLYCLEANFILES += $(SPECIFICATIONS)
+BUILT_SOURCES += protocol-binary.txt protocol-binary-range.txt
+MOSTLYCLEANFILES = protocol-binary.txt protocol-binary-range.txt
 endif
 
-RFC2629_XSL = $(srcdir)/xml2rfc/rfc2629-noinc.xsl
-RFC2629_DTD = $(srcdir)/xml2rfc/rfc2629.dtd
+protocol-binary.txt: protocol-binary.full
+	@XML2RFC@ -c @abs_builddir@ protocol-binary.full $@
 
-%.txt: %.full $(RFC2629_DTD)
-	@XML2RFC@ -d $(RFC2629_DTD) -c $(builddir) $< $@
+protocol-binary-range.txt: protocol-binary-range.full
+	@XML2RFC@ -c @abs_builddir@ protocol-binary-range.full $@
 
-%.full: %.xml $(RFC2629_XSL)
-	@XSLTPROC@ --nonet $(RFC2629_XSL) $< > $@
+protocol-binary.full: protocol-binary.xml xml2rfc/rfc2629-noinc.xsl
+	@XSLTPROC@ --nonet xml2rfc/rfc2629-noinc.xsl protocol-binary.xml > $@
 
-# Prevent make from deleting intermediate files
-all-full: $(SPECIFICATIONS:.txt=.full)
+protocol-binary-range.full: protocol-binary-range.xml xml2rfc/rfc2629-noinc.xsl
+	@XSLTPROC@ --nonet xml2rfc/rfc2629-noinc.xsl protocol-binary-range.xml > $@
 
-clean-local:
-	rm -f $(SPECIFICATIONS:.txt=.full)
-
-.PHONY: all-full

@@ -57,7 +57,7 @@ provider memcached {
     * @param connid the connection id
     * @param threadid the thread id
     */
-   probe conn__dispatch(int connid, int64_t threadid);
+   probe conn__dispatch(int connid, int threadid);
 
    /**
     * Allocate memory from the slab allocator.
@@ -111,15 +111,19 @@ provider memcached {
     * Fired when a new item has been inserted.
     * @param key the key just inserted
     * @param keylen length of the key
+    * @param nokeys the total number of keys currently stored,
+    *               including the key for which insert was called.
     */
-   probe assoc__insert(const char *key, int keylen);
+   probe assoc__insert(const char *key, int keylen, int nokeys);
 
    /**
     * Fired when a new item has been removed.
     * @param key the key just deleted
     * @param keylen length of the key
+    * @param nokeys the total number of keys currently stored,
+    *               excluding the key for which delete was called.
     */
-   probe assoc__delete(const char *key, int keylen);
+   probe assoc__delete(const char *key, int keylen, int nokeys);
 
    /**
     * Fired when an item is linked into the cache.
@@ -168,7 +172,7 @@ provider memcached {
    /**
     * Fired when the processing of a command starts.
     * @param connid the connection id
-    * @param request the incoming request
+    * @param request the incomming request
     * @param size the size of the request
     */
    probe process__command__start(int connid, const void *request, int size);
@@ -176,7 +180,7 @@ provider memcached {
    /**
     * Fired when the processing of a command is done.
     * @param connid the connection id
-    * @param response the response to send back to the client
+    * @param respnse the response to send back to the client
     * @param size the size of the response
     */
    probe process__command__end(int connid, const void *response, int size);

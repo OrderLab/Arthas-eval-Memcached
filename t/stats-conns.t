@@ -1,7 +1,7 @@
 #!/usr/bin/perl
 
 use strict;
-use Test::More tests => 12;
+use Test::More tests => 10;
 use FindBin qw($Bin);
 use lib "$Bin/lib";
 use MemcachedTest;
@@ -44,15 +44,13 @@ like($stats, qr/STAT \d+:state conn_parse_cmd/,
      "one client is in command processing");
 like($stats, qr/STAT \d+:secs_since_last_cmd [1-9]\r/,
      "nonzero secs_since_last_cmd");
-like($stats, qr/STAT \d+:listen_addr unix:\/tmp\/memcachetest\d+\r/,
-     "found listen_addr for the UNIX-domain socket");
 
 $server->stop;
 unlink($filename);
 
 ## Now look at TCP
 
-$server = new_memcached("-l 0.0.0.0");
+$server = new_memcached();
 $sock = $server->sock;
 $stats_sock = $server->new_sock;
 
@@ -69,8 +67,4 @@ like($stats, qr/STAT \d+:state conn_listen/, "there is a listen socket");
 $stats =~ m/STAT \d+:addr udp:0.0.0.0:(\d+)/;
 is($1, $server->udpport, "udp port number is correct");
 $stats =~ m/STAT \d+:addr tcp:0.0.0.0:(\d+)/;
-print STDERR "PORT: ", $server->port, "\n";
 is($1, $server->port, "tcp port number is correct");
-
-$stats =~ m/STAT \d+:listen_addr tcp:0.0.0.0:(\d+)/;
-is($1, $server->port, "listen_addr is correct for the tcp port");

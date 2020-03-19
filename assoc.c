@@ -27,8 +27,9 @@
 
 static pthread_cond_t maintenance_cond = PTHREAD_COND_INITIALIZER;
 static pthread_mutex_t maintenance_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t hash_items_counter_lock = PTHREAD_MUTEX_INITIALIZER;
 
-typedef  uint32_t  ub4;   /* unsigned 4-byte quantities */
+typedef  unsigned long  int  ub4;   /* unsigned 4-byte quantities */
 typedef  unsigned       char ub1;   /* unsigned 1-byte quantities */
 
 /* how many powers of 2's worth of buckets we use */
@@ -46,8 +47,12 @@ static item** primary_hashtable = 0;
  */
 static item** old_hashtable = 0;
 
+/* Number of items in the hash table. */
+static unsigned int hash_items = 0;
+
 /* Flag: Are we in the middle of expanding now? */
 static bool expanding = false;
+static bool started_expanding = false;
 
 /*
  * During expansion we migrate values with bucket granularity; this is how
@@ -89,7 +94,9 @@ item *assoc_find(const char *key, const size_t nkey, const uint32_t hv) {
             ret = it;
             break;
         }
+	//fprintf(stdout, "it: %p it next: %p\n", (void *)it, (void *)it->h_next);
         it = it->h_next;
+	//fprintf(stdout, "why we here %p\n", (void *)it);
         ++depth;
     }
     MEMCACHED_ASSOC_FIND(key, nkey, depth);
@@ -139,13 +146,12 @@ static void assoc_expand(void) {
     }
 }
 
-void assoc_start_expand(uint64_t curr_items) {
-    if (pthread_mutex_trylock(&maintenance_lock) == 0) {
-        if (curr_items > (hashsize(hashpower) * 3) / 2 && hashpower < HASHPOWER_MAX) {
-            pthread_cond_signal(&maintenance_cond);
-        }
-        pthread_mutex_unlock(&maintenance_lock);
-    }
+static void assoc_start_expand(void) {
+    if (started_expanding)
+        return;
+
+    started_expanding = true;
+    pthread_cond_signal(&maintenance_cond);
 }
 
 /* Note: this isn't an assoc_update.  The key must not already exist to call this */
@@ -158,13 +164,23 @@ int assoc_insert(item *it, const uint32_t hv) {
         (oldbucket = (hv & hashmask(hashpower - 1))) >= expand_bucket)
     {
         it->h_next = old_hashtable[oldbucket];
+	fprintf(stderr, "old hashtable expand %p", (void *)it->h_next);
         old_hashtable[oldbucket] = it;
     } else {
+	fprintf(stderr, "insertion %p", (void *)it->h_next);
         it->h_next = primary_hashtable[hv & hashmask(hashpower)];
+	fprintf(stderr, "insertion %p", (void *)it->h_next);
         primary_hashtable[hv & hashmask(hashpower)] = it;
     }
 
-    MEMCACHED_ASSOC_INSERT(ITEM_key(it), it->nkey);
+    pthread_mutex_lock(&hash_items_counter_lock);
+    hash_items++;
+    if (! expanding && hash_items > (hashsize(hashpower) * 3) / 2) {
+        assoc_start_expand();
+    }
+    pthread_mutex_unlock(&hash_items_counter_lock);
+
+    MEMCACHED_ASSOC_INSERT(ITEM_key(it), it->nkey, hash_items);
     return 1;
 }
 
@@ -173,13 +189,17 @@ void assoc_delete(const char *key, const size_t nkey, const uint32_t hv) {
 
     if (*before) {
         item *nxt;
+        pthread_mutex_lock(&hash_items_counter_lock);
+        hash_items--;
+        pthread_mutex_unlock(&hash_items_counter_lock);
         /* The DTrace probe cannot be triggered as the last instruction
          * due to possible tail-optimization by the compiler
          */
-        MEMCACHED_ASSOC_DELETE(key, nkey);
+        MEMCACHED_ASSOC_DELETE(key, nkey, hash_items);
         nxt = (*before)->h_next;
         (*before)->h_next = 0;   /* probably pointless, but whatever. */
         *before = nxt;
+	fprintf(stderr, "assoc deletion %p %p", (void *)nxt, (void *)nxt->h_next);
         return;
     }
     /* Note:  we never actually get here.  the callers don't delete things
@@ -202,7 +222,7 @@ static void *assoc_maintenance_thread(void *arg) {
         /* There is only one expansion thread, so no need to global lock. */
         for (ii = 0; ii < hash_bulk_move && expanding; ++ii) {
             item *it, *next;
-            unsigned int bucket;
+            int bucket;
             void *item_lock = NULL;
 
             /* bucket = hv & hashmask(hashpower) =>the bucket of hash table
@@ -215,6 +235,7 @@ static void *assoc_maintenance_thread(void *arg) {
                         bucket = hash(ITEM_key(it), it->nkey) & hashmask(hashpower);
                         it->h_next = primary_hashtable[bucket];
                         primary_hashtable[bucket] = it;
+			fprintf(stderr, "maintenance %p", (void *)it->h_next);
                     }
 
                     old_hashtable[expand_bucket] = NULL;
@@ -243,6 +264,7 @@ static void *assoc_maintenance_thread(void *arg) {
 
         if (!expanding) {
             /* We are done expanding.. just wait for next invocation */
+            started_expanding = false;
             pthread_cond_wait(&maintenance_cond, &maintenance_lock);
             /* assoc_expand() swaps out the hash table entirely, so we need
              * all threads to not hold any references related to the hash
@@ -251,14 +273,11 @@ static void *assoc_maintenance_thread(void *arg) {
              * allow dynamic hash table expansion without causing significant
              * wait times.
              */
-            if (do_run_maintenance_thread) {
-                pause_threads(PAUSE_ALL_THREADS);
-                assoc_expand();
-                pause_threads(RESUME_ALL_THREADS);
-            }
+            pause_threads(PAUSE_ALL_THREADS);
+            assoc_expand();
+            pause_threads(RESUME_ALL_THREADS);
         }
     }
-    mutex_unlock(&maintenance_lock);
     return NULL;
 }
 
@@ -273,7 +292,7 @@ int start_assoc_maintenance_thread() {
             hash_bulk_move = DEFAULT_HASH_BULK_MOVE;
         }
     }
-
+    pthread_mutex_init(&maintenance_lock, NULL);
     if ((ret = pthread_create(&maintenance_tid, NULL,
                               assoc_maintenance_thread, NULL)) != 0) {
         fprintf(stderr, "Can't create thread: %s\n", strerror(ret));
