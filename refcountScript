@@ -1,0 +1,5 @@
+#!/bin/bash
+(sleep 4 ; timeout 4 perl script.pl 127.0.0.1:11211) &
+(sleep 8 ; ./killScript ) & 
+sudo ./memcached -p 11211 -U 11211 -u root -d -vv 1
+wait
