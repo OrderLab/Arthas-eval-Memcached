@@ -1,0 +1,4 @@
+#!/bin/bash
+#sudo ./configure --enable-pslab
+sudo make
+sudo make install

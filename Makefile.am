@@ -22,7 +22,8 @@ memcached_SOURCES = memcached.c memcached.h \
                     bipbuffer.c bipbuffer.h \
                     logger.c logger.h \
                     crawler.c crawler.h \
-                    itoa_ljust.c itoa_ljust.h
+                    itoa_ljust.c itoa_ljust.h \
+                    slab_automove.c slab_automove.h
 
 if BUILD_CACHE
 memcached_SOURCES += cache.c
@@ -33,8 +34,27 @@ if BUILD_SOLARIS_PRIVS
 memcached_SOURCES += solaris_priv.c
 endif
 
+if BUILD_LINUX_PRIVS
+memcached_SOURCES += linux_priv.c
+endif
+
+if BUILD_OPENBSD_PRIVS
+memcached_SOURCES += openbsd_priv.c
+endif
+
 if ENABLE_SASL
 memcached_SOURCES += sasl_defs.c
+endif
+
+if ENABLE_EXTSTORE
+memcached_SOURCES += extstore.c extstore.h \
+                     crc32c.c crc32c.h \
+                     storage.c storage.h \
+                     slab_automove_extstore.c slab_automove_extstore.h
+endif
+
+if ENABLE_TLS
+memcached_SOURCES += tls.c tls.h
 endif
 
 memcached_debug_SOURCES = $(memcached_SOURCES)
@@ -46,6 +66,11 @@ memcached_LDADD =
 memcached_DEPENDENCIES =
 memcached_debug_DEPENDENCIES =
 CLEANFILES=
+
+if BUILD_LINUX_PRIVS
+memcached_LDADD += -lseccomp
+memcached_debug_LDADD += -lseccomp
+endif
 
 if BUILD_DTRACE
 BUILT_SOURCES += memcached_dtrace.h
@@ -59,6 +84,17 @@ memcached_debug_LDADD += memcached_debug_dtrace.o
 memcached_debug_DEPENDENCIES += memcached_debug_dtrace.o
 CLEANFILES += memcached_dtrace.o memcached_debug_dtrace.o
 endif
+
+if ENABLE_PSLAB
+#memcached_LDADD =
+#memcached_debug_LDADD =
+#memcached_LDADD =-Wl,-rpath=/home/brian/a_bug_project/feb17/1.8-PMDK-Arthas/src/nondebug -lpmemobj -lpmem
+#memcached_debug_LDADD = -Wl,-rpath=/home/brian/a_bug_project/feb17/1.8-PMDK-Arthas/src/nondebug -lpmemobj -lpmem
+memcached_LDADD += pmdk/src/nondebug/libpmemobj.a pmdk/src/nondebug/libpmem.a
+memcached_debug_LDADD += pmdk/src/nondebug/libpmemobj.a pmdk/src/nondebug/libpmem.a
+endif
+
+memcached_debug_CFLAGS += -DMEMCACHED_DEBUG
 
 memcached_dtrace.h: memcached_dtrace.d
 	${DTRACE} -h -s memcached_dtrace.d
@@ -79,10 +115,34 @@ EXTRA_DIST = doc scripts t memcached.spec memcached_dtrace.d version.m4 README.m
 
 MOSTLYCLEANFILES = *.gcov *.gcno *.gcda *.tcov
 
+if ENABLE_TLS
+test_tls:
+	$(MAKE) SSL_TEST=1 test
+
+test_basic_tls:
+	@if test $(SSL_TEST)1 != 1; then \
+	  echo "Running basic tests with TLS"; \
+	  $(srcdir)/testapp; \
+	  prove $(srcdir)/t/binary.t $(srcdir)/t/getset.t $(srcdir)/t/ssl*; \
+	  echo "Finished running basic TLS tests"; \
+	else \
+	  echo "Set SSL_TEST=1 to enable TLS tests"; \
+	fi
+endif
+
 test:	memcached-debug sizes testapp
 	$(srcdir)/sizes
 	$(srcdir)/testapp
-	prove $(srcdir)/t
+if ENABLE_TLS
+	@if test $(SSL_TEST)1 = 1; then \
+          $(MAKE) SSL_TEST=1  test_basic_tls; \
+	fi
+endif
+	@if test -n "${PARALLEL}"; then \
+	  prove $(srcdir)/t -j ${PARALLEL}; \
+	else \
+	  prove $(srcdir)/t; \
+	fi
 	@if test `basename $(PROFILER)` = "gcov"; then \
 	  for file in memcached_debug-*.gc??; do \
 	    mv -f $$file `echo $$file | sed 's/memcached_debug-//'`; \

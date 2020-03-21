@@ -2,12 +2,12 @@
 
 use strict;
 use warnings;
-use Test::More tests => 221;
+use Test::More tests => 222;
 use FindBin qw($Bin);
 use lib "$Bin/lib";
 use MemcachedTest;
 
-my $server = new_memcached('-m 32');
+my $server = new_memcached('-m 32 -o no_modern');
 {
     my $stats = mem_stats($server->sock, ' settings');
     is($stats->{lru_crawler}, "no");
@@ -60,6 +60,18 @@ while (1) {
     is($items->{"items:1:crawler_reclaimed"}, 30, "slab1 has 30 reclaims");
 }
 
+# Check that crawler metadump works correctly.
+{
+    print $sock "lru_crawler metadump all\r\n";
+    my $count = 0;
+    while (<$sock>) {
+        last if /^(\.|END)/;
+        /^(key=) (\S+).*([^\r\n]+)/;
+        $count++;
+    }
+    is ($count, 60);
+}
+
 for (1 .. 30) {
     mem_get_is($sock, "ifoo$_", "ok");
     mem_get_is($sock, "lfoo$_", "ok");
@@ -76,7 +88,7 @@ is(scalar <$sock>, "OK\r\n", "disabled lru crawler");
 $server->stop;
 
 # Test initializing crawler from starttime.
-$server = new_memcached('-m 32 -o lru_crawler');
+$server = new_memcached('-m 32 -o no_modern,lru_crawler');
 $sock = $server->sock;
 
 for (1 .. 30) {

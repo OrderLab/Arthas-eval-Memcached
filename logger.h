@@ -19,13 +19,26 @@ enum log_entry_type {
     LOGGER_ITEM_GET,
     LOGGER_ITEM_STORE,
     LOGGER_CRAWLER_STATUS,
+    LOGGER_SLAB_MOVE,
+#ifdef EXTSTORE
+    LOGGER_EXTSTORE_WRITE,
+    LOGGER_COMPACT_START,
+    LOGGER_COMPACT_ABORT,
+    LOGGER_COMPACT_READ_START,
+    LOGGER_COMPACT_READ_END,
+    LOGGER_COMPACT_END,
+    LOGGER_COMPACT_FRAGINFO,
+#endif
 };
 
 enum log_entry_subtype {
     LOGGER_TEXT_ENTRY = 0,
     LOGGER_EVICTION_ENTRY,
     LOGGER_ITEM_GET_ENTRY,
-    LOGGER_ITEM_STORE_ENTRY
+    LOGGER_ITEM_STORE_ENTRY,
+#ifdef EXTSTORE
+    LOGGER_EXT_WRITE_ENTRY,
+#endif
 };
 
 enum logger_ret_type {
@@ -56,7 +69,17 @@ struct logentry_eviction {
     uint8_t clsid;
     char key[];
 };
-
+#ifdef EXTSTORE
+struct logentry_ext_write {
+    long long int exptime;
+    uint32_t latime;
+    uint16_t it_flags;
+    uint8_t nkey;
+    uint8_t clsid;
+    uint8_t bucket;
+    char key[];
+};
+#endif
 struct logentry_item_get {
     uint8_t was_found;
     uint8_t nkey;
@@ -77,6 +100,7 @@ struct logentry_item_store {
 
 typedef struct _logentry {
     enum log_entry_subtype event;
+    uint8_t pad;
     uint16_t eflags;
     uint64_t gid;
     struct timeval tv; /* not monotonic! */
@@ -92,7 +116,7 @@ typedef struct _logentry {
 #define LOG_MUTATIONS  (1<<3) /* set/append/incr/etc */
 #define LOG_SYSERRORS  (1<<4) /* malloc/etc errors */
 #define LOG_CONNEVENTS (1<<5) /* new client, closed, etc */
-#define LOG_EVICTIONS  (1<<6) /* defailts of evicted items */
+#define LOG_EVICTIONS  (1<<6) /* details of evicted items */
 #define LOG_STRICT     (1<<7) /* block worker instead of drop */
 #define LOG_RAWCMDS    (1<<9) /* raw ascii commands */
 

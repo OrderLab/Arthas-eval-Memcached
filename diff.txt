@@ -1,0 +1,27 @@
+ memcached-1.5.13/assoc.c => assoc.c                |   71 +-
+ memcached-1.5.13/assoc.h => assoc.h                |    1 -
+## memcached-1.5.13/cache.c => cache.c                |    2 -
+#3 memcached-1.5.13/cache.h => cache.h                |    3 +-
+## memcached-1.5.13/crawler.c => crawler.c            |    4 +-
+# memcached-1.5.13/extstore.c => extstore.c          |   26 +-
+# memcached-1.5.13/extstore.h => extstore.h          |    1 +
+## freebsd_priv.c                                     |   22 +
+## globals.c                                          |   26 +
+ memcached-1.5.13/items.c => items.c                |  113 +-
+ memcached-1.5.13/items.h => items.h                |    2 +-
+## memcached-1.5.13/linux_priv.c => linux_priv.c      |   50 +-
+## memcached-1.5.13/logger.c => logger.c              |   40 +-
+## memcached-1.5.13/logger.h => logger.h              |    2 +
+## memcached-1.5.13/autom4te.cache/requests           |  173 --
+## memcached-1.5.13/config.h                          |  171 --
+## memcached-1.5.13/config.h.in                       |  170 --
+## memcached-1.5.13/config.h.in~                      |  167 --
+ memcached-1.5.13/memcached.c => memcached.c        |  910 +++++----
+ memcached-1.5.13/memcached.h => memcached.h        |   53 +-
+ memcached-1.5.13/slabs.c => slabs.c                |  274 +--
+ memcached-1.5.13/slabs.h => slabs.h                |   12 +-
+## memcached-1.5.13/solaris_priv.c => solaris_priv.c  |    4 +
+## memcached-1.5.13/storage.c => storage.c            |    4 +-
+## memcached-1.5.13/testapp.c => testapp.c            |   14 +
+## memcached-1.5.13/thread.c => thread.c              |   11 +
+### memcached-1.5.13/util.c => util.c                  |    2 +-
