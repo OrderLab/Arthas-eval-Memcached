@@ -1321,13 +1321,13 @@ static void complete_nread_ascii(conn *c) {
       case STORED:
           out_string(c, "STORED");
 	  //end of set
-          TX_BEGIN(settings.pm_pool){
+          /*TX_BEGIN(settings.pm_pool){
             pmemobj_tx_add_range_direct(it, sizeof(it));
             pmemobj_tx_add_range_direct(ITEM_data(it), it->nbytes);
             pmemobj_tx_add_range_direct(ITEM_key(it), it->nkey);
           }TX_ONABORT{
             printf("abortion in insertion: %s\n", pmemobj_errormsg());
-          }TX_END
+          }TX_END*/
 	  //clock_t end = clock();
 	  //double time_here = (double)(end-start)/CLOCKS_PER_SEC;
 	  //set_count++;
@@ -8091,6 +8091,7 @@ int main (int argc, char **argv) {
         settings.pool_uuid = pmemoid.pool_uuid_lo;
         uint64_t *num = pmemobj_direct(pmemoid);
         *num = (uint64_t)settings.pm_pool;
+         printf("num is %p offset is %ld\n", (void *)num, (uint64_t)num);
     }
     else{
 	recovery = 1;

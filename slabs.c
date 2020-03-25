@@ -152,7 +152,8 @@ void slabs_init(const size_t limit, const double factor, const bool prealloc, co
 	oid = pmemobj_tx_zalloc(sizeof(slabclass_t) * MAX_NUMBER_OF_SLAB_CLASSES, 10);
 	slabclass = pmemobj_direct(oid);
 	//pmemobj_tx_add_range_direct(slabclass,sizeof(slabclass_t) * MAX_NUMBER_OF_SLAB_CLASSES );
-
+	printf("address of slabclass is %p, offset is %ld, size is %ld\n", 
+        (void *)slabclass, (uint64_t)slabclass, sizeof(slabclass_t) * MAX_NUMBER_OF_SLAB_CLASSES);
     /* Some platforms use runtime transparent hugepages. If for any reason
      * the initial allocation fails, the required settings do not persist
      * for remaining allocations. As such it makes little sense to do slab
@@ -162,7 +163,8 @@ void slabs_init(const size_t limit, const double factor, const bool prealloc, co
     mem_limit = limit;
     PMEMoid curr = pmemobj_tx_zalloc(sizeof(void *), 20);
     pmem_current = pmemobj_direct(curr);
-
+    printf("pmem_current is %p offset is %ld, size is %ld\n", pmem_current, (uint64_t)pmem_current,
+    sizeof(void *));
     if (prealloc) {
 #if defined(__linux__) && defined(MADV_HUGEPAGE)
         fprintf(stderr, "in madv hugepage\n");
@@ -175,6 +177,8 @@ void slabs_init(const size_t limit, const double factor, const bool prealloc, co
 	PMEMoid oid2;
 	oid2 = pmemobj_tx_zalloc(mem_limit, 12);
 	mem_base = pmemobj_direct(oid2);
+        printf("mem_base is %p offset is %ld, size is %ld\n", mem_base, (uint64_t)mem_base,
+        mem_limit);
         do_slab_prealloc = true;
 #endif
         if (mem_base != NULL) {
@@ -478,7 +482,9 @@ static void do_slabs_free(void *ptr, const size_t size, unsigned int id) {
     MEMCACHED_SLABS_FREE(size, id, ptr);
     p = &slabclass[id];
     pmemobj_tx_add_range_direct(ptr , size);
-    pmemobj_tx_add_range_direct(slabclass,sizeof(slabclass_t) * MAX_NUMBER_OF_SLAB_CLASSES );
+    //printf("slabs free %p %ld\n", ptr, size);
+    //pmemobj_tx_add_range_direct(slabclass,sizeof(slabclass_t) * MAX_NUMBER_OF_SLAB_CLASSES );
+    //printf("slabs free\n");
     //pmemobj_tx_add_range_direct(p->slots , size);
     //pmemobj_tx_add_range_direct(&p->sl_curr, sizeof(p->sl_curr));
     //pmemobj_tx_add_range_direct(p->slab_list[p->slabs], p->size * p->perslab);
@@ -648,6 +654,8 @@ static void *memory_allocate(size_t size) {
                 PMEMoid oid;
                 oid = pmemobj_tx_zalloc(size , 1);
                 ret = pmemobj_direct(oid);
+                printf("ret of slab memory allocate is %p offset is %ld, size is %ld\n", 
+                ret, (uint64_t)ret, size);
     } else {
         ret = mem_current;
 
@@ -1421,7 +1429,10 @@ void slab_recovery(PMEMoid root, uint64_t old_pool){
 							temp_item->prev = (item *)((uint64_t)temp_item->prev - old_pool + (uint64_t)settings.pm_pool);
 						}
 						if(temp_item->h_next){
+							printf("item ref is %hu\n", temp_item->refcount);
 							temp_item->h_next = (item *)((uint64_t)temp_item->h_next - old_pool + (uint64_t)settings.pm_pool);
+							printf("temp_item->h_next is %p\n", (void *)temp_item->h_next);
+							//temp_item->h_next = NULL;
 						}
 						if(temp_item->it_flags & ITEM_LINKED){
 							item_link_fixup(temp_item);
