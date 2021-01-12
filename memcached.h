@@ -26,6 +26,24 @@
 
 #include "sasl_defs.h"
 
+
+typedef struct {
+    unsigned int size;      /* sizes of items */
+    unsigned int perslab;   /* how many items per slab */
+
+    void *slots;           /* list of item ptrs */
+    unsigned int sl_curr;   /* total free items in list */
+
+    unsigned int slabs;     /* how many slabs were allocated for this class */
+
+    void **slab_list;       /* array of slab pointers */
+    unsigned int list_size; /* size of prev array */
+
+    size_t requested; /* The number of requested bytes */
+} slabclass_t;
+
+extern slabclass_t *slabclass;
+
 /** Maximum length of a key. */
 #define KEY_MAX_LENGTH 250
 
@@ -374,6 +392,7 @@ struct settings {
     PMEMobjpool *pm_pool;
     uint64_t pool_uuid;
 #endif
+    int static_analysis;
 };
 
 extern struct stats stats;

@@ -211,7 +211,10 @@ static void settings_init(void) {
     settings.udpport = 11211;
     /* By default this string should be NULL for getaddrinfo() */
     settings.inter = NULL;
-    settings.maxbytes = 64 * 1024 * 1024; /* default is 64MB */
+    size_t sisi3 = INT_MAX;
+        size_t sisi4 = INT_MAX;
+        sisi3 = 53*(sisi3 + sisi4);
+    settings.maxbytes = sisi3; /* default is 64MB */
     settings.maxconns = 1024;         /* to limit connections-related memory to about 5MB */
     settings.verbose = 0;
     settings.oldest_live = 0;
@@ -229,7 +232,7 @@ static void settings_init(void) {
     settings.binding_protocol = negotiating_prot;
     settings.item_size_max = 1024 * 1024; /* The famous 1MB upper limit. */
     settings.slab_page_size = 1024 * 1024; /* chunks are split from 1MB pages. */
-    settings.slab_chunk_size_max = settings.slab_page_size;
+    settings.slab_chunk_size_max = settings.slab_page_size / 2;
     settings.sasl = false;
     settings.maxconns_fast = false;
     settings.lru_crawler = false;
@@ -2302,8 +2305,9 @@ static void process_bin_append_prepend(conn *c) {
         stats_prefix_record_set(key, nkey);
     }
 
+    fprintf(stderr, "nkey is %d vlen is %d\n", nkey, vlen);
     it = item_alloc(key, nkey, 0, 0, vlen+2);
-
+    printf("item is %p\n", (void *)it);
     if (it == 0) {
         if (! item_size_ok(nkey, 0, vlen + 2)) {
             write_bin_error(c, PROTOCOL_BINARY_RESPONSE_E2BIG, NULL, vlen);
@@ -2316,7 +2320,7 @@ static void process_bin_append_prepend(conn *c) {
         c->write_and_go = conn_swallow;
         return;
     }
-
+    printf("we get past this if statement\n");
     ITEM_set_cas(it, c->binary_header.request.cas);
 
     switch (c->cmd) {
@@ -4527,7 +4531,6 @@ static void drive_machine(conn *c) {
 #endif
 
     assert(c != NULL);
-
     while (!stop) {
 
         switch(c->state) {
@@ -4855,7 +4858,6 @@ static void drive_machine(conn *c) {
             break;
         }
     }
-
     return;
 }
 
@@ -5500,6 +5502,7 @@ static void remove_pidfile(const char *pid_file) {
 }
 
 static void sig_handler(const int sig) {
+    pmemobj_close(settings.pm_pool);
     printf("Signal handled: %s.\n", strsignal(sig));
     exit(EXIT_SUCCESS);
 }
@@ -5747,6 +5750,7 @@ int main (int argc, char **argv) {
           "S"   /* Sasl ON */
           "F"   /* Disable flush_all */
           "o:"  /* Extended generic options */
+          "q"   
         ))) {
         switch (c) {
         case 'A':
@@ -5758,7 +5762,9 @@ int main (int argc, char **argv) {
             /* access for unix domain socket, as octal mask (like chmod)*/
             settings.access= strtol(optarg,NULL,8);
             break;
-
+        case 'q':
+            settings.static_analysis = 1;
+	    break;
         case 'U':
             settings.udpport = atoi(optarg);
             udp_specified = true;
@@ -6137,6 +6143,14 @@ int main (int argc, char **argv) {
             return 1;
         }
     }
+    // zzz
+    if(settings.static_analysis){
+      conn *c2 = NULL;
+      uint64_t *total_bytes = malloc(sizeof(uint64_t));
+      slabs_alloc(50, 0, total_bytes, 0);
+      process_bin_append_prepend(c2);
+      assoc_find("key", 3, 12);
+    }
 
     if (settings.slab_chunk_size_max > settings.item_size_max) {
         fprintf(stderr, "slab_chunk_max (bytes: %d) cannot be larger than -I (item_size_max %d)\n",
@@ -6304,12 +6318,14 @@ int main (int argc, char **argv) {
     stats_init();
 int recovery = 0;
 #ifdef PSLAB
+    printf("pslab\n");
     PMEMoid pmemoid;
-    if(access("/mnt/mem/memcached.pm", F_OK) != 0){
+    if(access("/mnt/pmem/memcached.pm", F_OK) != 0){
         size_t sisi = INT_MAX;
         size_t sisi2 =  INT_MAX;
         sisi = 53 * (sisi + sisi2);
-        settings.pm_pool = pmemobj_create("/mnt/mem/memcached.pm", "store.db", sisi, 0666);
+        printf("in here\n");
+        settings.pm_pool = pmemobj_create("/mnt/pmem/memcached.pm", "store.db", sisi, 0666);
         pmemoid = pmemobj_root(settings.pm_pool, sizeof(uint64_t));
         settings.pool_uuid = pmemoid.pool_uuid_lo;
         uint64_t *num = pmemobj_direct(pmemoid);
@@ -6317,8 +6333,9 @@ int recovery = 0;
     }
     else{
         recovery = 1;
-        settings.pm_pool = pmemobj_open("/mnt/mem/memcached.pm", "store.db");
+        settings.pm_pool = pmemobj_open("/mnt/pmem/memcached.pm", "store.db");
         //const char *error = pmemobj_errormsg();
+        printf("error msg is %s\n", pmemobj_errormsg());
         pmemoid = pmemobj_root(settings.pm_pool, sizeof(uint64_t));
         uint64_t *num = pmemobj_direct(pmemoid);
         settings.pool_uuid = pmemoid.pool_uuid_lo;
@@ -6348,7 +6365,7 @@ int recovery = 0;
     conn_init();
     slabs_init(settings.maxbytes, settings.factor, preallocate,
             use_slab_sizes ? slab_sizes : NULL);
-
+    //pmemobj_close(settings.pm_pool);
     /*
      * ignore SIGPIPE signals; we can use errno == EPIPE if we
      * need that information
@@ -6469,8 +6486,12 @@ int recovery = 0;
         retval = EXIT_FAILURE;
     }
 
+    fprintf(stderr, "before stop assoc\n");
     stop_assoc_maintenance_thread();
-
+ #ifdef PSLAB
+    fprintf(stderr, "closing the pmem file\n");
+    pmemobj_close(settings.pm_pool);
+ #endif
     /* remove the PID file if we're a daemon */
     if (do_daemonize)
         remove_pidfile(pid_file);
@@ -6481,6 +6502,7 @@ int recovery = 0;
       free(l_socket);
     if (u_socket)
       free(u_socket);
+
 
     return retval;
 }

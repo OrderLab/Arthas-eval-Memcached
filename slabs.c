@@ -24,22 +24,7 @@
 //#define DEBUG_SLAB_MOVER
 /* powers-of-N allocation structures */
 
-typedef struct {
-    unsigned int size;      /* sizes of items */
-    unsigned int perslab;   /* how many items per slab */
-
-    void *slots;           /* list of item ptrs */
-    unsigned int sl_curr;   /* total free items in list */
-
-    unsigned int slabs;     /* how many slabs were allocated for this class */
-
-    void **slab_list;       /* array of slab pointers */
-    unsigned int list_size; /* size of prev array */
-
-    size_t requested; /* The number of requested bytes */
-} slabclass_t;
-
-static slabclass_t slabclass[MAX_NUMBER_OF_SLAB_CLASSES];
+slabclass_t *slabclass;
 static size_t mem_limit = 0;
 static size_t mem_malloced = 0;
 /* If the memory limit has been hit once. Used as a hint to decide when to
@@ -49,6 +34,7 @@ static int power_largest;
 
 static void *mem_base = NULL;
 static void *mem_current = NULL;
+void *pmem_current;
 static size_t mem_avail = 0;
 
 /**
@@ -98,12 +84,27 @@ unsigned int slabs_clsid(const size_t size) {
 void slabs_init(const size_t limit, const double factor, const bool prealloc, const uint32_t *slab_sizes) {
     int i = POWER_SMALLEST - 1;
     unsigned int size = sizeof(item) + settings.chunk_size;
-
+   TX_BEGIN(settings.pm_pool){
+        PMEMoid oid;
+        oid = pmemobj_tx_zalloc(sizeof(slabclass_t) * MAX_NUMBER_OF_SLAB_CLASSES, 10);
+        slabclass = pmemobj_direct(oid);
+        //pmemobj_tx_add_range_direct(slabclass,sizeof(slabclass_t) * MAX_NUMBER_OF_SLAB_CLASSES );
+        printf("address of slabclass is %p, offset is %ld, size is %ld\n",
+        (void *)slabclass, (uint64_t)slabclass, sizeof(slabclass_t) * MAX_NUMBER_OF_SLAB_CLASSES);
     mem_limit = limit;
-
+    PMEMoid curr = pmemobj_tx_zalloc(sizeof(void *), 20);
+    pmem_current = pmemobj_direct(curr);
+    printf("pmem_current is %p offset is %ld, size is %ld\n", pmem_current, (uint64_t)pmem_current,
+    sizeof(void *));
     if (prealloc) {
         /* Allocate everything in a big chunk with malloc */
-        mem_base = malloc(mem_limit);
+        //mem_base = malloc(mem_limit);
+        fprintf(stderr, "big chunk malloc\n");
+        PMEMoid oid2;
+        oid2 = pmemobj_tx_zalloc(mem_limit, 12);
+        mem_base = pmemobj_direct(oid2);
+        printf("mem_base is %p offset is %ld, size is %ld\n", mem_base, (uint64_t)mem_base,
+        mem_limit);
         if (mem_base != NULL) {
             mem_current = mem_base;
             mem_avail = mem_limit;
@@ -113,7 +114,7 @@ void slabs_init(const size_t limit, const double factor, const bool prealloc, co
         }
     }
 
-    memset(slabclass, 0, sizeof(slabclass));
+    memset(slabclass, 0, sizeof(slabclass) * MAX_NUMBER_OF_SLAB_CLASSES);
 
     while (++i < MAX_NUMBER_OF_SLAB_CLASSES-1) {
         if (slab_sizes != NULL) {
@@ -157,6 +158,11 @@ void slabs_init(const size_t limit, const double factor, const bool prealloc, co
     if (prealloc) {
         slabs_preallocate(power_largest);
     }
+    }TX_ONABORT{
+        fprintf(stderr, "slab init has failed\n");
+    }TX_ONCOMMIT{
+        fprintf(stderr, "slab init has finished!\n");
+    }TX_END
 }
 
 static void slabs_preallocate (const unsigned int maxslabs) {
@@ -186,7 +192,18 @@ static int grow_slab_list (const unsigned int id) {
     slabclass_t *p = &slabclass[id];
     if (p->slabs == p->list_size) {
         size_t new_size =  (p->list_size != 0) ? p->list_size * 2 : 16;
-        void *new_list = realloc(p->slab_list, new_size * sizeof(void *));
+        void *new_list = NULL;
+        //void *new_list = realloc(p->slab_list, new_size * sizeof(void *));
+        TX_BEGIN(settings.pm_pool){
+                PMEMoid oid;
+                oid = pmemobj_oid(p->slab_list);
+                oid = pmemobj_tx_realloc(oid, new_size * sizeof(void *), 1);
+                new_list = pmemobj_direct(oid);
+        }TX_ONABORT{
+                fprintf(stderr, "big chunk allocation has failed\n");
+        }TX_ONCOMMIT{
+                //fprintf(stderr, "big chunk allocation has finished!\n");
+        }TX_END
         if (new_list == 0) return 0;
         p->list_size = new_size;
         p->slab_list = new_list;
@@ -215,6 +232,7 @@ static void *get_page_from_global_pool(void) {
 }
 
 static int do_slabs_newslab(const unsigned int id) {
+    printf("do slab newslab\n");
     slabclass_t *p = &slabclass[id];
     slabclass_t *g = &slabclass[SLAB_GLOBAL_PAGE_POOL];
     int len = (settings.slab_reassign || settings.slab_chunk_size_max != settings.slab_page_size)
@@ -310,7 +328,7 @@ static void *do_slabs_alloc(const size_t size, unsigned int id, uint64_t *total_
     slabclass_t *p;
     void *ret = NULL;
     item *it = NULL;
-
+    TX_BEGIN(settings.pm_pool){
     if (id < POWER_SMALLEST || id > power_largest) {
         MEMCACHED_SLABS_ALLOCATE_FAILED(size, 0);
         return NULL;
@@ -331,12 +349,20 @@ static void *do_slabs_alloc(const size_t size, unsigned int id, uint64_t *total_
         if (p->sl_curr != 0) {
             /* return off our freelist */
             it = (item *)p->slots;
+            it->nbytes = 0;
+            it->nkey = 0;
+            pmemobj_tx_add_range_direct(it, sizeof(item) );
+            pmemobj_tx_add_range_direct(&p->slots, sizeof(void *) );
+            //printf("p->slots is %p\n", (void *)&p->slots);
             p->slots = it->next;
+            //printf("p->slots is %p\n", (void *)&p->slots);
             if (it->next) it->next->prev = 0;
             /* Kill flag and initialize refcount here for lock safety in slab
              * mover's freeness detection. */
             it->it_flags &= ~ITEM_SLABBED;
             it->refcount = 1;
+            //printf("p->sl_curr is %p\n", (void *)&p->sl_curr);
+            pmemobj_tx_add_range_direct(&p->sl_curr, sizeof(unsigned int));
             p->sl_curr--;
             ret = (void *)it;
         } else {
@@ -353,7 +379,7 @@ static void *do_slabs_alloc(const size_t size, unsigned int id, uint64_t *total_
     } else {
         MEMCACHED_SLABS_ALLOCATE_FAILED(size, id);
     }
-
+    }TX_END
     return ret;
 }
 
@@ -532,10 +558,15 @@ static void do_slabs_stats(ADD_STAT add_stats, void *c) {
 
 static void *memory_allocate(size_t size) {
     void *ret;
-
+    TX_BEGIN(settings.pm_pool){
     if (mem_base == NULL) {
         /* We are not using a preallocated large memory chunk */
-        ret = malloc(size);
+        PMEMoid oid;
+                oid = pmemobj_tx_zalloc(size , 1);
+                ret = pmemobj_direct(oid);
+                printf("ret of slab memory allocate is %p offset is %ld, size is %ld\n",
+                ret, (uint64_t)ret, size);
+        //ret = malloc(size);
     } else {
         ret = mem_current;
 
@@ -549,6 +580,7 @@ static void *memory_allocate(size_t size) {
         }
 
         mem_current = ((char*)mem_current) + size;
+        pmem_current = mem_current;
         if (size < mem_avail) {
             mem_avail -= size;
         } else {
@@ -556,7 +588,11 @@ static void *memory_allocate(size_t size) {
         }
     }
     mem_malloced += size;
-
+    }TX_ONABORT{
+                fprintf(stderr, "small chunk allocation has failed\n");
+        }TX_ONCOMMIT{
+                //fprintf(stderr, "small chunk allocation has finished!\n");
+        }TX_END
     return ret;
 }
 
@@ -1219,7 +1255,8 @@ void stop_slab_maintenance_thread(void) {
 }
 void slab_recovery(PMEMoid root, uint64_t old_pool){
         slabclass_t * temp;
-
+        int no_bad_values = 0;
+        printf("begin recovery\n");
         TX_BEGIN(settings.pm_pool){
                 PMEMoid slabclass_oid = POBJ_FIRST_TYPE_NUM(settings.pm_pool, 10);
                 temp = pmemobj_direct(slabclass_oid);
@@ -1240,6 +1277,11 @@ void slab_recovery(PMEMoid root, uint64_t old_pool){
                                         for(int x = 0; x < temp[i].perslab; x++){
                                                 //fprintf(stderr, "validated slab list %d %d\n", x, tem$
                                                 temp_item= (item *)checked;
+						if(temp_item->nkey > 0 && temp_item->nbytes < -100){
+							no_bad_values = 1;
+							printf("offset is %ld\n", (uint64_t)temp_item - (uint64_t)settings.pm_pool);
+							printf("item key %d len %d\n", temp_item->nkey, temp_item->nbytes);
+						}
                                                 if (temp_item->next){
                                                         temp_item->next = (item *)((uint64_t)temp_item->next - old_pool + (uint64_t)settings.pm_pool);
                                                 }
@@ -1269,7 +1311,9 @@ void slab_recovery(PMEMoid root, uint64_t old_pool){
         }TX_ONCOMMIT{
                 fprintf(stderr, "finished recovery\n");
         }TX_END
-
-
+        if(no_bad_values == 0){
+          fprintf(stderr, "no bad values\n");
+          printf("no bad values\n");
+	}
 }
 

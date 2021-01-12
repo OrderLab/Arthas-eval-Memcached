@@ -230,7 +230,13 @@ item *do_item_alloc(char *key, const size_t nkey, const unsigned int flags,
         id |= COLD_LRU;
     }
     it->slabs_clsid = id;
-
+    TX_BEGIN(settings.pm_pool){
+    it->nkey = 0;
+    it->nbytes = 0;
+    pmemobj_tx_add_range_direct(it, (sizeof(item)));
+    }TX_END
+    //pmemobj_tx_add_range_direct(&it->nbytes, (sizeof(it->nbytes)));
+    //printf("it offset is %ld\n", (uint64_t)it  - (uint64_t)settings.pm_pool);
     DEBUG_REFCNT(it, '*');
     it->it_flags |= settings.use_cas ? ITEM_CAS : 0;
     it->nkey = nkey;
@@ -254,7 +260,6 @@ item *do_item_alloc(char *key, const size_t nkey, const unsigned int flags,
         assert(chunk->size > 0);
     }
     it->h_next = 0;
-
     return it;
 }
 
@@ -1304,3 +1309,27 @@ item *do_item_crawl_q(item *it) {
 
     return it->next; /* success */
 }
+
+
+
+void item_link_fixup(item *it){
+        //fprintf(stderr, "begin fixup\n");
+        item **head, **tail;
+        int ntotal = ITEM_ntotal(it);
+        head = &heads[it->slabs_clsid];
+        tail = &tails[it->slabs_clsid];
+        if (it->prev == 0 && *head == 0) *head = it;
+        if (it->next == 0 && *tail == 0) *tail = it;
+        sizes[it->slabs_clsid]++;
+        sizes_bytes[it->slabs_clsid] += ntotal;
+
+        STATS_LOCK();
+        stats_state.curr_bytes += ntotal;
+        stats_state.curr_items += 1;
+        stats.total_items += 1;
+        STATS_UNLOCK();
+
+        item_stats_sizes_add(it);
+        //fprintf(stderr, "fixup done!\n");
+}
+

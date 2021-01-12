@@ -8,3 +8,4 @@ int start_assoc_maintenance_thread(void);
 void stop_assoc_maintenance_thread(void);
 extern unsigned int hashpower;
 extern unsigned int item_lock_hashpower;
+void assoc_recovery(PMEMoid root, uint64_t old_pool);

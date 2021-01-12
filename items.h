@@ -52,3 +52,4 @@ int stop_lru_maintainer_thread(void);
 int init_lru_maintainer(void);
 void lru_maintainer_pause(void);
 void lru_maintainer_resume(void);
+void item_link_fixup(item *it);
