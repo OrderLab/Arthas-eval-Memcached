@@ -82,6 +82,9 @@ fi
 AM_PROG_CC_C_O
 AC_PROG_INSTALL
 
+AC_ARG_ENABLE(pslab,
+  [AS_HELP_STRING([--enable-pslab], [Enable persistent memory slab EXPERIMENTAL ])])
+
 AC_ARG_ENABLE(sasl,
   [AS_HELP_STRING([--enable-sasl],[Enable SASL authentication])])
 
@@ -91,6 +94,9 @@ AC_ARG_ENABLE(sasl_pwdb,
 AS_IF([test "x$enable_sasl_pwdb" = "xyes"],
       [enable_sasl=yes ])
 
+if test "x$enable_pslab" = "xyes"; then
+    AC_DEFINE([PSLAB],1,[Set to nonzero if you want to enable pslab])
+fi
 
 
 dnl **********************************************************************
@@ -156,6 +162,7 @@ fi
 AM_CONDITIONAL([BUILD_DTRACE],[test "$build_dtrace" = "yes"])
 AM_CONDITIONAL([DTRACE_INSTRUMENT_OBJ],[test "$dtrace_instrument_obj" = "yes"])
 AM_CONDITIONAL([ENABLE_SASL],[test "$enable_sasl" = "yes"])
+AM_CONDITIONAL([ENABLE_PSLAB],[test "$enable_pslab" = "yes"])
 
 AC_SUBST(DTRACE)
 AC_SUBST(DTRACEFLAGS)
