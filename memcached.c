@@ -273,7 +273,7 @@ static void settings_init(void) {
 	size_t sisi3 = INT_MAX;
 	size_t sisi4 = INT_MAX;
 	sisi3 = 53*(sisi3 + sisi4);
-    settings.maxbytes = sisi3 ; /* default is 64MB */
+    settings.maxbytes = sisi3/4; /* default is 64MB */
     settings.maxconns = 1024;         /* to limit connections-related memory to about 5MB */
     settings.verbose = 0;
     settings.oldest_live = 0;
@@ -1321,13 +1321,13 @@ static void complete_nread_ascii(conn *c) {
       case STORED:
           out_string(c, "STORED");
 	  //end of set
-          /*TX_BEGIN(settings.pm_pool){
-            pmemobj_tx_add_range_direct(it, sizeof(it));
-            pmemobj_tx_add_range_direct(ITEM_data(it), it->nbytes);
-            pmemobj_tx_add_range_direct(ITEM_key(it), it->nkey);
+          TX_BEGIN(settings.pm_pool){
+            pmemobj_tx_add_range_direct(it, sizeof(item));
+            //pmemobj_tx_add_range_direct(ITEM_data(it), it->nbytes);
+            //pmemobj_tx_add_range_direct(ITEM_key(it), it->nkey);
           }TX_ONABORT{
             printf("abortion in insertion: %s\n", pmemobj_errormsg());
-          }TX_END*/
+          }TX_END
 	  //clock_t end = clock();
 	  //double time_here = (double)(end-start)/CLOCKS_PER_SEC;
 	  //set_count++;
@@ -2671,8 +2671,7 @@ static void process_bin_append_prepend(conn *c) {
     if (settings.detail_enabled) {
         stats_prefix_record_set(key, nkey);
     }
-    nkey = 250;
-    vlen = -250;
+    fprintf(stderr, "nkey is %d vlen is %d\n", nkey, vlen);
     it = item_alloc(key, nkey, 0, 0, vlen+2);
 
     if (it == 0) {
@@ -7094,6 +7093,7 @@ int main (int argc, char **argv) {
           "F"   /* Disable flush_all */
           "X"   /* Disable dump commands */
           "o:"  /* Extended generic options */
+          "q"   /* Static Analysis Entry Function added by Brian */
           ;
 
     /* process arguments */
@@ -7160,6 +7160,9 @@ int main (int argc, char **argv) {
         case 'U':
             settings.udpport = atoi(optarg);
             udp_specified = true;
+            break;
+        case 'q':
+            settings.static_analysis = 1;
             break;
         case 'p':
             settings.port = atoi(optarg);
@@ -8086,7 +8089,8 @@ int main (int argc, char **argv) {
 	size_t sisi = INT_MAX;
 	size_t sisi2 =  INT_MAX;
 	sisi = 53 * (sisi + sisi2);
-        settings.pm_pool = pmemobj_create("/mnt/pmem/memcached.pm", "store.db", sisi, 0666);
+        settings.pm_pool = pmemobj_create("/mnt/pmem/memcached.pm", "store.db", sisi/4, 0666);
+        printf("pm pool memcached is %p\n", (void *)settings.pm_pool);
         pmemoid = pmemobj_root(settings.pm_pool, sizeof(uint64_t));
         settings.pool_uuid = pmemoid.pool_uuid_lo;
         uint64_t *num = pmemobj_direct(pmemoid);
@@ -8122,6 +8126,70 @@ int main (int argc, char **argv) {
         //    use_slab_sizes ? slab_sizes : NULL);
 
     }
+    //zzzz
+    if(settings.static_analysis){
+      // Declare variables
+      /*conn *c = malloc(sizeof(conn));
+      enum conn_states cs= 0;
+      slabclass_t *p = &slabclass[0];
+      item *it = (item *)p->slots;*/
+
+      // Calling every function in memcached.bc
+      //store_item(it, 0, c);
+      //do_store_item(it, 0  c, 0);
+      /*slabs_alloc(50, 0 , total_bytes, 0);
+      conn_close_idle(c);
+      conn_set_state(c, cs);
+      drive_machine(c);
+      update_event(c, 0);
+      complete_nread(c);
+      conn_release_items(c);
+      conn_cleanup(c);
+      complete_nread_ascii(c);
+      complete_nread_binary(c);
+      process_bin_append_prepend(c);
+      process_bin_update(c);
+      process_bin_get_or_touch(c);
+      process_bin_stat(c);
+      process_bin_delete(c);
+      complete_incr_bin(c);
+      process_bin_flush(c);
+      process_command(c,"aa"); */
+
+      //item functions
+      /*do_item_alloc_pull(0,0);
+      do_item_unlink_nolock(it, 0);
+      do_item_remove(it);
+      do_item_update_nolock(it);
+      item_link(it);
+      item_free(it);
+      do_item_alloc("key", 3, 0,0,0);
+      do_item_link(it, 0);
+      do_item_unlink(it, 0);
+      do_item_update(it);
+      do_item_replace(it, it, 0);
+      do_item_get("key", 0, 0, c, false);
+      do_item_touch("key", 0, 0, 0, c);
+      item_lock(0);
+      item_unlock(0);
+      item_alloc("key", 3, 0, 0, 0);
+      item_get("key", 3, c, false);
+      item_touch("key", 3, 0, 0);
+      item_link(it);
+      item_remove(it);
+      item_unlink(it);
+      store_item(it, 0, c);*/
+       
+      //assoc functions
+      assoc_find("key", 3, 0);
+      /*assoc_start_expand(0);
+      assoc_insert(it, 0);
+      assoc_delete("key", 3, 0);
+      start_assoc_maintenance_thread();*/
+    }
+
+
+    //uint64_t *total_bytes = malloc(sizeof(uint64_t));
 #ifdef EXTSTORE
     if (storage_file) {
         enum extstore_res eres;
@@ -8301,6 +8369,7 @@ int main (int argc, char **argv) {
 
     /* cleanup base */
     event_base_free(main_base);
+
 
     return retval;
 }
