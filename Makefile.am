@@ -4,7 +4,7 @@ noinst_PROGRAMS = memcached-debug sizes testapp timedrun
 
 BUILT_SOURCES=
 
-testapp_SOURCES = testapp.c util.c util.h stats_prefix.c stats_prefix.h jenkins_hash.c murmur3_hash.c hash.c hash.h cache.c
+testapp_SOURCES = testapp.c util.c util.h
 
 timedrun_SOURCES = timedrun.c
 
@@ -16,16 +16,19 @@ memcached_SOURCES = memcached.c memcached.h \
                     items.c items.h \
                     assoc.c assoc.h \
                     thread.c daemon.c \
-                    stats_prefix.c stats_prefix.h \
+                    stats.c stats.h \
                     util.c util.h \
-                    trace.h cache.c cache.h sasl_defs.h \
+                    trace.h cache.h sasl_defs.h \
                     bipbuffer.c bipbuffer.h \
                     logger.c logger.h \
                     crawler.c crawler.h \
                     itoa_ljust.c itoa_ljust.h \
-                    slab_automove.c slab_automove.h \
-                    authfile.c authfile.h \
-                    restart.c restart.h
+                    slab_automove.c slab_automove.h
+
+if BUILD_CACHE
+memcached_SOURCES += cache.c
+testapp_SOURCES += cache.c
+endif
 
 if BUILD_SOLARIS_PRIVS
 memcached_SOURCES += solaris_priv.c
@@ -37,10 +40,6 @@ endif
 
 if BUILD_OPENBSD_PRIVS
 memcached_SOURCES += openbsd_priv.c
-endif
-
-if BUILD_FREEBSD_PRIVS
-memcached_SOURCES += freebsd_priv.c
 endif
 
 if ENABLE_SASL
@@ -86,6 +85,15 @@ memcached_debug_DEPENDENCIES += memcached_debug_dtrace.o
 CLEANFILES += memcached_dtrace.o memcached_debug_dtrace.o
 endif
 
+if ENABLE_PSLAB
+#memcached_LDADD =
+#memcached_debug_LDADD =
+#memcached_LDADD =-Wl,-rpath=/home/brian/a_bug_project/feb17/1.8-PMDK-Arthas/src/nondebug -lpmemobj -lpmem
+#memcached_debug_LDADD = -Wl,-rpath=/home/brian/a_bug_project/feb17/1.8-PMDK-Arthas/src/nondebug -lpmemobj -lpmem
+memcached_LDADD += pmdk/src/nondebug/libpmemobj.a pmdk/src/nondebug/libpmem.a
+memcached_debug_LDADD += pmdk/src/nondebug/libpmemobj.a pmdk/src/nondebug/libpmem.a
+endif
+
 memcached_debug_CFLAGS += -DMEMCACHED_DEBUG
 
 memcached_dtrace.h: memcached_dtrace.d
@@ -114,7 +122,7 @@ test_tls:
 test_basic_tls:
 	@if test $(SSL_TEST)1 != 1; then \
 	  echo "Running basic tests with TLS"; \
-	  $(builddir)/testapp; \
+	  $(srcdir)/testapp; \
 	  prove $(srcdir)/t/binary.t $(srcdir)/t/getset.t $(srcdir)/t/ssl*; \
 	  echo "Finished running basic TLS tests"; \
 	else \
@@ -123,8 +131,8 @@ test_basic_tls:
 endif
 
 test:	memcached-debug sizes testapp
-	$(builddir)/sizes
-	$(builddir)/testapp
+	$(srcdir)/sizes
+	$(srcdir)/testapp
 if ENABLE_TLS
 	@if test $(SSL_TEST)1 = 1; then \
           $(MAKE) SSL_TEST=1  test_basic_tls; \

@@ -24,7 +24,6 @@
 /* Forward Declarations */
 static void item_link_q(item *it);
 static void item_unlink_q(item *it);
-
 static unsigned int lru_type_map[4] = {HOT_LRU, WARM_LRU, COLD_LRU, TEMP_LRU};
 
 #define LARGEST_ID POWER_LARGEST
@@ -48,7 +47,6 @@ typedef struct {
     uint64_t hits_to_warm;
     uint64_t hits_to_cold;
     uint64_t hits_to_temp;
-    uint64_t mem_requested;
     rel_time_t evicted_time;
 } itemstats_t;
 
@@ -60,7 +58,6 @@ static uint64_t sizes_bytes[LARGEST_ID];
 static unsigned int *stats_sizes_hist = NULL;
 static uint64_t stats_sizes_cas_min = 0;
 static int stats_sizes_buckets = 0;
-static uint64_t cas_id = 0;
 
 static volatile int do_run_lru_maintainer_thread = 0;
 static int lru_maintainer_initialized = 0;
@@ -110,16 +107,11 @@ static uint64_t lru_total_bumps_dropped(void);
 /* Get the next CAS id for a new item. */
 /* TODO: refactor some atomics for this. */
 uint64_t get_cas_id(void) {
+    static uint64_t cas_id = 0;
     pthread_mutex_lock(&cas_id_lock);
     uint64_t next_id = ++cas_id;
     pthread_mutex_unlock(&cas_id_lock);
     return next_id;
-}
-
-void set_cas_id(uint64_t new_cas) {
-    pthread_mutex_lock(&cas_id_lock);
-    cas_id = new_cas;
-    pthread_mutex_unlock(&cas_id_lock);
 }
 
 int item_is_flushed(item *it) {
@@ -133,6 +125,16 @@ int item_is_flushed(item *it) {
         return 1;
     }
     return 0;
+}
+
+static unsigned int temp_lru_size(int slabs_clsid) {
+    int id = CLEAR_LRU(slabs_clsid);
+    id |= TEMP_LRU;
+    unsigned int ret;
+    pthread_mutex_lock(&lru_locks[id]);
+    ret = sizes_bytes[id];
+    pthread_mutex_unlock(&lru_locks[id]);
+    return ret;
 }
 
 /* must be locked before call */
@@ -154,6 +156,7 @@ unsigned int do_get_lru_size(uint32_t id) {
 /**
  * Generates the variable-sized part of the header for an object.
  *
+ * key     - The key
  * nkey    - The length of the key
  * flags   - key flags
  * nbytes  - Number of bytes to hold value and addition CRLF terminator
@@ -164,10 +167,15 @@ unsigned int do_get_lru_size(uint32_t id) {
  */
 static size_t item_make_header(const uint8_t nkey, const unsigned int flags, const int nbytes,
                      char *suffix, uint8_t *nsuffix) {
-    if (flags == 0) {
-        *nsuffix = 0;
+    if (settings.inline_ascii_response) {
+        /* suffix is defined at 40 chars elsewhere.. */
+        *nsuffix = (uint8_t) snprintf(suffix, 40, " %u %d\r\n", flags, nbytes - 2);
     } else {
-        *nsuffix = sizeof(flags);
+        if (flags == 0) {
+            *nsuffix = 0;
+        } else {
+            *nsuffix = sizeof(flags);
+        }
     }
     return sizeof(item) + nkey + *nsuffix + nbytes;
 }
@@ -175,6 +183,7 @@ static size_t item_make_header(const uint8_t nkey, const unsigned int flags, con
 item *do_item_alloc_pull(const size_t ntotal, const unsigned int id) {
     item *it = NULL;
     int i;
+    TX_BEGIN(settings.pm_pool){
     /* If no memory is available, attempt a direct LRU juggle/eviction */
     /* This is a race in order to simplify lru_pull_tail; in cases where
      * locked items are on the tail, you want them to fall out and cause
@@ -182,19 +191,20 @@ item *do_item_alloc_pull(const size_t ntotal, const unsigned int id) {
      * This also gives one fewer code path for slab alloc/free
      */
     for (i = 0; i < 10; i++) {
+        uint64_t total_bytes;
         /* Try to reclaim memory first */
         if (!settings.lru_segmented) {
             lru_pull_tail(id, COLD_LRU, 0, 0, 0, NULL);
         }
-        it = slabs_alloc(ntotal, id, 0);
+        it = slabs_alloc(ntotal, id, &total_bytes, 0);
+
+        if (settings.temp_lru)
+            total_bytes -= temp_lru_size(id);
 
         if (it == NULL) {
-            // We send '0' in for "total_bytes" as this routine is always
-            // pulling to evict, or forcing HOT -> COLD migration.
-            // As of this writing, total_bytes isn't at all used with COLD_LRU.
-            if (lru_pull_tail(id, COLD_LRU, 0, LRU_PULL_EVICT, 0, NULL) <= 0) {
+            if (lru_pull_tail(id, COLD_LRU, total_bytes, LRU_PULL_EVICT, 0, NULL) <= 0) {
                 if (settings.lru_segmented) {
-                    lru_pull_tail(id, HOT_LRU, 0, 0, 0, NULL);
+                    lru_pull_tail(id, HOT_LRU, total_bytes, 0, 0, NULL);
                 } else {
                     break;
                 }
@@ -209,7 +219,7 @@ item *do_item_alloc_pull(const size_t ntotal, const unsigned int id) {
         itemstats[id].direct_reclaims += i;
         pthread_mutex_unlock(&lru_locks[id]);
     }
-
+    }TX_END
     return it;
 }
 
@@ -252,13 +262,12 @@ item *do_item_alloc(char *key, const size_t nkey, const unsigned int flags,
     // Avoid potential underflows.
     if (nbytes < 2)
         return 0;
-
+  TX_BEGIN(settings.pm_pool){
     size_t ntotal = item_make_header(nkey + 1, flags, nbytes, suffix, &nsuffix);
     if (settings.use_cas) {
         ntotal += sizeof(uint64_t);
     }
-
-    unsigned int id = slabs_clsid(ntotal);
+unsigned int id = slabs_clsid(ntotal);
     unsigned int hdr_id = 0;
     if (id == 0)
         return 0;
@@ -298,7 +307,7 @@ item *do_item_alloc(char *key, const size_t nkey, const unsigned int flags,
         return NULL;
     }
 
-    assert(it->it_flags == 0 || it->it_flags == ITEM_CHUNKED);
+    assert(it->slabs_clsid == 0);
     //assert(it != heads[id]);
 
     /* Refcount is seeded to 1 by slabs_alloc() */
@@ -320,15 +329,17 @@ item *do_item_alloc(char *key, const size_t nkey, const unsigned int flags,
 
     DEBUG_REFCNT(it, '*');
     it->it_flags |= settings.use_cas ? ITEM_CAS : 0;
-    it->it_flags |= nsuffix != 0 ? ITEM_CFLAGS : 0;
     it->nkey = nkey;
     it->nbytes = nbytes;
+	pmemobj_tx_add_range_direct(ITEM_key(it), nkey);
     memcpy(ITEM_key(it), key, nkey);
     it->exptime = exptime;
-    if (nsuffix > 0) {
+    if (settings.inline_ascii_response) {
+        memcpy(ITEM_suffix(it), suffix, (size_t)nsuffix);
+    } else if (nsuffix > 0) {
         memcpy(ITEM_suffix(it), &flags, sizeof(flags));
     }
-
+    it->nsuffix = nsuffix;
     /* Initialize internal chunk. */
     if (it->it_flags & ITEM_CHUNKED) {
         item_chunk *chunk = (item_chunk *) ITEM_schunk(it);
@@ -341,7 +352,7 @@ item *do_item_alloc(char *key, const size_t nkey, const unsigned int flags,
         chunk->orig_clsid = hdr_id;
     }
     it->h_next = 0;
-
+    }TX_END
     return it;
 }
 
@@ -378,35 +389,10 @@ bool item_size_ok(const size_t nkey, const int flags, const int nbytes) {
     return slabs_clsid(ntotal) != 0;
 }
 
-/* fixing stats/references during warm start */
-void do_item_link_fixup(item *it) {
-    item **head, **tail;
-    int ntotal = ITEM_ntotal(it);
-    uint32_t hv = hash(ITEM_key(it), it->nkey);
-    assoc_insert(it, hv);
-
-    head = &heads[it->slabs_clsid];
-    tail = &tails[it->slabs_clsid];
-    if (it->prev == 0 && *head == 0) *head = it;
-    if (it->next == 0 && *tail == 0) *tail = it;
-    sizes[it->slabs_clsid]++;
-    sizes_bytes[it->slabs_clsid] += ntotal;
-
-    STATS_LOCK();
-    stats_state.curr_bytes += ntotal;
-    stats_state.curr_items += 1;
-    stats.total_items += 1;
-    STATS_UNLOCK();
-
-    item_stats_sizes_add(it);
-
-    return;
-}
-
 static void do_item_link_q(item *it) { /* item is the new head */
     item **head, **tail;
     assert((it->it_flags & ITEM_SLABBED) == 0);
-
+    TX_BEGIN(settings.pm_pool){
     head = &heads[it->slabs_clsid];
     tail = &tails[it->slabs_clsid];
     assert(it != *head);
@@ -426,7 +412,7 @@ static void do_item_link_q(item *it) { /* item is the new head */
 #else
     sizes_bytes[it->slabs_clsid] += ITEM_ntotal(it);
 #endif
-
+    }TX_END
     return;
 }
 
@@ -445,6 +431,7 @@ static void item_link_q_warm(item *it) {
 
 static void do_item_unlink_q(item *it) {
     item **head, **tail;
+    TX_BEGIN(settings.pm_pool){
     head = &heads[it->slabs_clsid];
     tail = &tails[it->slabs_clsid];
 
@@ -471,7 +458,7 @@ static void do_item_unlink_q(item *it) {
 #else
     sizes_bytes[it->slabs_clsid] -= ITEM_ntotal(it);
 #endif
-
+    }TX_END
     return;
 }
 
@@ -482,6 +469,7 @@ static void item_unlink_q(item *it) {
 }
 
 int do_item_link(item *it, const uint32_t hv) {
+    TX_BEGIN(settings.pm_pool){
     MEMCACHED_ITEM_LINK(ITEM_key(it), it->nkey, it->nbytes);
     assert((it->it_flags & (ITEM_LINKED|ITEM_SLABBED)) == 0);
     it->it_flags |= ITEM_LINKED;
@@ -499,11 +487,12 @@ int do_item_link(item *it, const uint32_t hv) {
     item_link_q(it);
     refcount_incr(it);
     item_stats_sizes_add(it);
-
+    }TX_END
     return 1;
 }
 
 void do_item_unlink(item *it, const uint32_t hv) {
+     TX_BEGIN(settings.pm_pool){
     MEMCACHED_ITEM_UNLINK(ITEM_key(it), it->nkey, it->nbytes);
     if ((it->it_flags & ITEM_LINKED) != 0) {
         it->it_flags &= ~ITEM_LINKED;
@@ -516,10 +505,12 @@ void do_item_unlink(item *it, const uint32_t hv) {
         item_unlink_q(it);
         do_item_remove(it);
     }
+}TX_END
 }
 
 /* FIXME: Is it necessary to keep this copy/pasted code? */
 void do_item_unlink_nolock(item *it, const uint32_t hv) {
+     TX_BEGIN(settings.pm_pool){
     MEMCACHED_ITEM_UNLINK(ITEM_key(it), it->nkey, it->nbytes);
     if ((it->it_flags & ITEM_LINKED) != 0) {
         it->it_flags &= ~ITEM_LINKED;
@@ -532,6 +523,7 @@ void do_item_unlink_nolock(item *it, const uint32_t hv) {
         do_item_unlink_q(it);
         do_item_remove(it);
     }
+}TX_END
 }
 
 void do_item_remove(item *it) {
@@ -541,6 +533,21 @@ void do_item_remove(item *it) {
 
     if (refcount_decr(it) == 0) {
         item_free(it);
+    }
+}
+
+/* Copy/paste to avoid adding two extra branches for all common calls, since
+ * _nolock is only used in an uncommon case where we want to relink. */
+void do_item_update_nolock(item *it) {
+    MEMCACHED_ITEM_UPDATE(ITEM_key(it), it->nkey, it->nbytes);
+    if (it->time < current_time - ITEM_UPDATE_INTERVAL) {
+        assert((it->it_flags & ITEM_SLABBED) == 0);
+
+        if ((it->it_flags & ITEM_LINKED) != 0) {
+            do_item_unlink_q(it);
+            it->time = current_time;
+            do_item_link_q(it);
+        }
     }
 }
 
@@ -559,7 +566,7 @@ void do_item_update(item *it) {
                 it->slabs_clsid |= WARM_LRU;
                 it->it_flags &= ~ITEM_ACTIVE;
                 item_link_q_warm(it);
-            } else {
+            } else if (it->time < current_time - ITEM_UPDATE_INTERVAL) {
                 it->time = current_time;
             }
         }
@@ -607,7 +614,6 @@ char *item_cachedump(const unsigned int slabs_clsid, const unsigned int limit, u
 
     buffer = malloc((size_t)memlimit);
     if (buffer == 0) {
-        pthread_mutex_unlock(&lru_locks[id]);
         return NULL;
     }
     bufcurr = 0;
@@ -761,7 +767,6 @@ void item_stats(ADD_STAT add_stats, void *c) {
             totals.moves_to_warm += itemstats[i].moves_to_warm;
             totals.moves_within_lru += itemstats[i].moves_within_lru;
             totals.direct_reclaims += itemstats[i].direct_reclaims;
-            totals.mem_requested += sizes_bytes[i];
             size += sizes[i];
             lru_size_map[x] = sizes[i];
             if (lru_type_map[x] == COLD_LRU && tails[i] != NULL) {
@@ -803,7 +808,6 @@ void item_stats(ADD_STAT add_stats, void *c) {
             APPEND_NUM_FMT_STAT(fmt, n, "age_warm", "%u", age_warm);
         }
         APPEND_NUM_FMT_STAT(fmt, n, "age", "%u", age);
-        APPEND_NUM_FMT_STAT(fmt, n, "mem_requested", "%llu", (unsigned long long)totals.mem_requested);
         APPEND_NUM_FMT_STAT(fmt, n, "evicted",
                             "%llu", (unsigned long long)totals.evicted);
         APPEND_NUM_FMT_STAT(fmt, n, "evicted_nonzero",
@@ -954,8 +958,11 @@ void item_stats_sizes(ADD_STAT add_stats, void *c) {
 /** wrapper around assoc_find which does the lazy expiration logic */
 item *do_item_get(const char *key, const size_t nkey, const uint32_t hv, conn *c, const bool do_update) {
     item *it = assoc_find(key, nkey, hv);
+    TX_BEGIN(settings.pm_pool){
     if (it != NULL) {
         refcount_incr(it);
+        //pmemobj_tx_add_range_direct(&it->refcount, sizeof(it->refcount));
+	//printf("item refcount is %d\n", it->refcount);
         /* Optimization for slab reassignment. prevents popular items from
          * jamming in busy wait. Can only do this here to satisfy lock order
          * of item_lock, slabs_lock. */
@@ -1019,7 +1026,30 @@ item *do_item_get(const char *key, const size_t nkey, const uint32_t hv, conn *c
             was_found = 3;
         } else {
             if (do_update) {
-                do_item_bump(c, it, hv);
+                /* We update the hit markers only during fetches.
+                 * An item needs to be hit twice overall to be considered
+                 * ACTIVE, but only needs a single hit to maintain activity
+                 * afterward.
+                 * FETCHED tells if an item has ever been active.
+                 */
+                if (settings.lru_segmented) {
+                    if ((it->it_flags & ITEM_ACTIVE) == 0) {
+                        if ((it->it_flags & ITEM_FETCHED) == 0) {
+                            it->it_flags |= ITEM_FETCHED;
+                        } else {
+                            it->it_flags |= ITEM_ACTIVE;
+                            if (ITEM_lruid(it) != COLD_LRU) {
+                                do_item_update(it); // bump LA time
+                            } else if (!lru_bump_async(c->thread->lru_bump_buf, it, hv)) {
+                                // add flag before async bump to avoid race.
+                                it->it_flags &= ~ITEM_ACTIVE;
+                            }
+                        }
+                    }
+                } else {
+                    it->it_flags |= ITEM_FETCHED;
+                    do_item_update(it);
+                }
             }
             DEBUG_REFCNT(it, '+');
         }
@@ -1029,39 +1059,9 @@ item *do_item_get(const char *key, const size_t nkey, const uint32_t hv, conn *c
         fprintf(stderr, "\n");
     /* For now this is in addition to the above verbose logging. */
     LOGGER_LOG(c->thread->l, LOG_FETCHERS, LOGGER_ITEM_GET, NULL, was_found, key, nkey,
-               (it) ? ITEM_clsid(it) : 0, c->sfd);
-
+               (it) ? ITEM_clsid(it) : 0);
+    }TX_END
     return it;
-}
-
-// Requires lock held for item.
-// Split out of do_item_get() to allow mget functions to look through header
-// data before losing state modified via the bump function.
-void do_item_bump(conn *c, item *it, const uint32_t hv) {
-    /* We update the hit markers only during fetches.
-     * An item needs to be hit twice overall to be considered
-     * ACTIVE, but only needs a single hit to maintain activity
-     * afterward.
-     * FETCHED tells if an item has ever been active.
-     */
-    if (settings.lru_segmented) {
-        if ((it->it_flags & ITEM_ACTIVE) == 0) {
-            if ((it->it_flags & ITEM_FETCHED) == 0) {
-                it->it_flags |= ITEM_FETCHED;
-            } else {
-                it->it_flags |= ITEM_ACTIVE;
-                if (ITEM_lruid(it) != COLD_LRU) {
-                    it->time = current_time; // only need to bump time.
-                } else if (!lru_bump_async(c->thread->lru_bump_buf, it, hv)) {
-                    // add flag before async bump to avoid race.
-                    it->it_flags &= ~ITEM_ACTIVE;
-                }
-            }
-        }
-    } else {
-        it->it_flags |= ITEM_FETCHED;
-        do_item_update(it);
-    }
 }
 
 item *do_item_touch(const char *key, size_t nkey, uint32_t exptime,
@@ -1167,8 +1167,7 @@ int lru_pull_tail(const int orig_id, const int cur_lru,
                     removed++;
                     if (cur_lru == WARM_LRU) {
                         itemstats[id].moves_within_lru++;
-                        do_item_unlink_q(search);
-                        do_item_link_q(search);
+                        do_item_update_nolock(search);
                         do_item_remove(search);
                         item_trylock_unlock(hold_lock);
                     } else {
@@ -1379,7 +1378,7 @@ static int lru_maintainer_juggle(const int slabs_clsid) {
     //unsigned int chunks_free = 0;
     /* TODO: if free_chunks below high watermark, increase aggressiveness */
     slabs_available_chunks(slabs_clsid, NULL,
-            &chunks_perslab);
+            &total_bytes, &chunks_perslab);
     if (settings.temp_lru) {
         /* Only looking for reclaims. Run before we size the LRU. */
         for (i = 0; i < 500; i++) {
@@ -1389,32 +1388,21 @@ static int lru_maintainer_juggle(const int slabs_clsid) {
                 did_moves++;
             }
         }
+        total_bytes -= temp_lru_size(slabs_clsid);
     }
 
     rel_time_t cold_age = 0;
     rel_time_t hot_age = 0;
     rel_time_t warm_age = 0;
-    /* If LRU is in flat mode, force items to drain into COLD via max age of 0 */
+    /* If LRU is in flat mode, force items to drain into COLD via max age */
     if (settings.lru_segmented) {
         pthread_mutex_lock(&lru_locks[slabs_clsid|COLD_LRU]);
         if (tails[slabs_clsid|COLD_LRU]) {
             cold_age = current_time - tails[slabs_clsid|COLD_LRU]->time;
         }
-        // Also build up total_bytes for the classes.
-        total_bytes += sizes_bytes[slabs_clsid|COLD_LRU];
         pthread_mutex_unlock(&lru_locks[slabs_clsid|COLD_LRU]);
-
         hot_age = cold_age * settings.hot_max_factor;
         warm_age = cold_age * settings.warm_max_factor;
-
-        // total_bytes doesn't have to be exact. cache it for the juggles.
-        pthread_mutex_lock(&lru_locks[slabs_clsid|HOT_LRU]);
-        total_bytes += sizes_bytes[slabs_clsid|HOT_LRU];
-        pthread_mutex_unlock(&lru_locks[slabs_clsid|HOT_LRU]);
-
-        pthread_mutex_lock(&lru_locks[slabs_clsid|WARM_LRU]);
-        total_bytes += sizes_bytes[slabs_clsid|WARM_LRU];
-        pthread_mutex_unlock(&lru_locks[slabs_clsid|WARM_LRU]);
     }
 
     /* Juggle HOT/WARM up to N times */
@@ -1722,7 +1710,10 @@ void lru_maintainer_resume(void) {
 }
 
 int init_lru_maintainer(void) {
-    lru_maintainer_initialized = 1;
+    if (lru_maintainer_initialized == 0) {
+        pthread_mutex_init(&lru_maintainer_lock, NULL);
+        lru_maintainer_initialized = 1;
+    }
     return 0;
 }
 
@@ -1823,4 +1814,25 @@ item *do_item_crawl_q(item *it) {
     assert(it->prev != it);
 
     return it->next; /* success */
+}
+
+void item_link_fixup(item *it){
+	//fprintf(stderr, "begin fixup\n");
+	item **head, **tail;
+	int ntotal = ITEM_ntotal(it);
+	head = &heads[it->slabs_clsid];
+	tail = &tails[it->slabs_clsid];
+	if (it->prev == 0 && *head == 0) *head = it;
+    	if (it->next == 0 && *tail == 0) *tail = it;
+   	sizes[it->slabs_clsid]++;
+    	sizes_bytes[it->slabs_clsid] += ntotal;
+
+    	STATS_LOCK();
+    	stats_state.curr_bytes += ntotal;
+    	stats_state.curr_items += 1;
+    	stats.total_items += 1;
+    	STATS_UNLOCK();
+
+    	item_stats_sizes_add(it);
+	//fprintf(stderr, "fixup done!\n");
 }

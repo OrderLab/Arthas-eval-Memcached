@@ -26,7 +26,3 @@ void drop_privileges() {
        }
      }
 }
-
-void setup_privilege_violations_handler(void) {
-   // not needed
-}

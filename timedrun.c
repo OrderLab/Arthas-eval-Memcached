@@ -1,7 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <string.h>
 #include <signal.h>
 #include <sys/wait.h>
 #include <sysexits.h>
@@ -22,14 +21,12 @@ static int wait_for_process(pid_t pid)
     int i = 0;
     struct sigaction sig_handler;
 
-    memset(&sig_handler, 0, sizeof(struct sigaction));
     sig_handler.sa_handler = signal_handler;
     sig_handler.sa_flags = 0;
 
     sigaction(SIGALRM, &sig_handler, NULL);
     sigaction(SIGHUP, &sig_handler, NULL);
     sigaction(SIGINT, &sig_handler, NULL);
-    sigaction(SIGUSR1, &sig_handler, NULL);
     sigaction(SIGTERM, &sig_handler, NULL);
     sigaction(SIGPIPE, &sig_handler, NULL);
 
@@ -91,16 +88,10 @@ static int spawn_and_wait(char **argv)
     return rv;
 }
 
-static void usage(void) {
-    fprintf(stderr, "./timedrun <naptime in sec> args...\n");
-    exit(-1);
-}
-
 int main(int argc, char **argv)
 {
     int naptime = 0;
-    if (argc < 3)
-        usage();
+    assert(argc > 2);
 
     naptime = atoi(argv[1]);
     assert(naptime > 0 && naptime < 1800);

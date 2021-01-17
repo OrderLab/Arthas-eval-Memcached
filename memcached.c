@@ -2,7 +2,7 @@
 /*
  *  memcached - memory caching daemon
  *
- *       https://www.memcached.org/
+ *       http://www.memcached.org/
  *
  *  Copyright 2003 Danga Interactive, Inc.  All rights reserved.
  *
@@ -17,8 +17,6 @@
 #ifdef EXTSTORE
 #include "storage.h"
 #endif
-#include "authfile.h"
-#include "restart.h"
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -28,11 +26,17 @@
 #include <sys/uio.h>
 #include <ctype.h>
 #include <stdarg.h>
-
+#ifdef PSLAB
+#include "libpmemobj.h"
+#endif
 /* some POSIX systems need the following definition
  * to get mlockall flags out of sys/mman.h.  */
 #ifndef _P1003_1B_VISIBLE
 #define _P1003_1B_VISIBLE
+#endif
+/* need this to get IOV_MAX on some platforms. */
+#ifndef __need_IOV_MAX
+#define __need_IOV_MAX
 #endif
 #include <pwd.h>
 #include <sys/mman.h>
@@ -45,6 +49,7 @@
 #include <string.h>
 #include <time.h>
 #include <assert.h>
+#include <limits.h>
 #include <sysexits.h>
 #include <stddef.h>
 
@@ -56,15 +61,32 @@
 #include "tls.h"
 #endif
 
-#if defined(__FreeBSD__)
-#include <sys/sysctl.h>
+/* FreeBSD 4.x doesn't have IOV_MAX exposed. */
+#ifndef IOV_MAX
+#if defined(__FreeBSD__) || defined(__APPLE__) || defined(__GNU__)
+# define IOV_MAX 1024
+/* GNU/Hurd don't set MAXPATHLEN
+ * http://www.gnu.org/software/hurd/hurd/porting/guidelines.html#PATH_MAX_tt_MAX_PATH_tt_MAXPATHL */
+#ifndef MAXPATHLEN
+#define MAXPATHLEN 4096
+#endif
+#endif
 #endif
 
+int replace_count = 0;
+double times[200000];
+int set_count = 0;
+int times_count = 1;
+clock_t set_start;
+clock_t start = 0;
+FILE *out_file;
+double latency_times[10000001];
 /*
  * forward declarations
  */
 static void drive_machine(conn *c);
 static int new_socket(struct addrinfo *ai);
+static int try_read_command(conn *c);
 static ssize_t tcp_read(conn *arg, void *buf, size_t count);
 static ssize_t tcp_sendmsg(conn *arg, struct msghdr *msg, int flags);
 static ssize_t tcp_write(conn *arg, void *buf, size_t count);
@@ -76,28 +98,18 @@ enum try_read_result {
     READ_MEMORY_ERROR      /** failed to allocate more memory */
 };
 
-static int try_read_command_negotiate(conn *c);
-static int try_read_command_udp(conn *c);
-static int try_read_command_binary(conn *c);
-static int try_read_command_ascii(conn *c);
-static int try_read_command_asciiauth(conn *c);
-
 static enum try_read_result try_read_network(conn *c);
 static enum try_read_result try_read_udp(conn *c);
 
 static void conn_set_state(conn *c, enum conn_states state);
 static int start_conn_timeout_thread();
 
-static mc_resp* resp_finish(conn *c, mc_resp *resp);
-
 /* stats */
 static void stats_init(void);
 static void server_stats(ADD_STAT add_stats, conn *c);
 static void process_stat_settings(ADD_STAT add_stats, void *c);
-static void conn_to_str(const conn *c, char *addr, char *svr_addr);
+static void conn_to_str(const conn *c, char *buf);
 
-/** Return a datum for stats in binary protocol */
-static bool get_stats(const char *stat_type, int nkey, ADD_STAT add_stats, void *c);
 
 /* defaults */
 static void settings_init(void);
@@ -110,25 +122,19 @@ static bool update_event(conn *c, const int new_flags);
 static void complete_nread(conn *c);
 static void process_command(conn *c, char *command);
 static void write_and_free(conn *c, char *buf, int bytes);
+static int ensure_iov_space(conn *c);
+static int add_iov(conn *c, const void *buf, int len);
+static int add_chunked_item_iovs(conn *c, item *it, int len);
+static int add_msghdr(conn *c);
 static void write_bin_error(conn *c, protocol_binary_response_status err,
                             const char *errstr, int swallow);
 static void write_bin_miss_response(conn *c, char *key, size_t nkey);
 
 #ifdef EXTSTORE
 static void _get_extstore_cb(void *e, obj_io *io, int ret);
-static inline int _get_extstore(conn *c, item *it, mc_resp *resp);
+static inline int _get_extstore(conn *c, item *it, int iovst, int iovcnt);
 #endif
 static void conn_free(conn *c);
-
-/** binprot handlers **/
-static void process_bin_flush(conn *c, char *extbuf);
-static void process_bin_append_prepend(conn *c);
-static void process_bin_update(conn *c, char *extbuf);
-static void process_bin_get_or_touch(conn *c, char *extbuf);
-static void process_bin_delete(conn *c);
-static void complete_incr_bin(conn *c, char *extbuf);
-static void process_bin_stat(conn *c);
-static void process_bin_sasl_auth(conn *c);
 
 /** exported globals **/
 struct stats stats;
@@ -143,7 +149,7 @@ volatile int slab_rebalance_signal;
 /* hoping this is temporary; I'd prefer to cut globals, but will complete this
  * battle another day.
  */
-void *ext_storage = NULL;
+void *ext_storage;
 #endif
 /** file scope variables **/
 static conn *listen_conn = NULL;
@@ -181,7 +187,6 @@ static enum transmit_result transmit(conn *c);
  * can block the listener via a condition.
  */
 static volatile bool allow_new_conns = true;
-static bool stop_main_loop = false;
 static struct event maxconnsevent;
 static void maxconns_handler(const int fd, const short which, void *arg) {
     struct timeval t = {.tv_sec = 0, .tv_usec = 10000};
@@ -198,13 +203,6 @@ static void maxconns_handler(const int fd, const short which, void *arg) {
 }
 
 #define REALTIME_MAXDELTA 60*60*24*30
-
-/* Negative exptimes can underflow and end up immortal. realtime() will
-   immediately expire values that are greater than REALTIME_MAXDELTA, but less
-   than process_started, so lets aim for that. */
-#define EXPTIME_TO_POSITIVE_TIME(exptime) (exptime < 0) ? \
-        REALTIME_MAXDELTA + 1 : exptime
-
 
 /*
  * given time value that's either unix time or delta from current unix time, return
@@ -241,7 +239,7 @@ static void stats_init(void) {
        like 'settings.oldest_live' which act as booleans as well as
        values are now false in boolean context... */
     process_started = time(0) - ITEM_UPDATE_INTERVAL - 2;
-    stats_prefix_init(settings.prefix_delimiter);
+    stats_prefix_init();
 }
 
 static void stats_reset(void) {
@@ -272,17 +270,19 @@ static void settings_init(void) {
 #endif
     /* By default this string should be NULL for getaddrinfo() */
     settings.inter = NULL;
-    settings.maxbytes = 64 * 1024 * 1024; /* default is 64MB */
+	size_t sisi3 = INT_MAX;
+	size_t sisi4 = INT_MAX;
+	sisi3 = 53*(sisi3 + sisi4);
+    settings.maxbytes = sisi3; /* default is 64MB */
     settings.maxconns = 1024;         /* to limit connections-related memory to about 5MB */
     settings.verbose = 0;
     settings.oldest_live = 0;
     settings.oldest_cas = 0;          /* supplements accuracy of oldest_live */
     settings.evict_to_free = 1;       /* push old items out of cache when memory runs out */
     settings.socketpath = NULL;       /* by default, not using a unix socket */
-    settings.auth_file = NULL;        /* by default, not using ASCII authentication tokens */
     settings.factor = 1.25;
     settings.chunk_size = 48;         /* space for a modest key and value */
-    settings.num_threads = 4;         /* N workers */
+    settings.num_threads = 16;         /* N workers */
     settings.num_threads_per_udp = 0;
     settings.prefix_delimiter = ':';
     settings.detail_enabled = 0;
@@ -290,7 +290,7 @@ static void settings_init(void) {
     settings.backlog = 1024;
     settings.binding_protocol = negotiating_prot;
     settings.item_size_max = 1024 * 1024; /* The famous 1MB upper limit. */
-    settings.slab_page_size = 1024 * 1024; /* chunks are split from 1MB pages. */
+    settings.slab_page_size = 1024*1024; /* chunks are split from 1MB pages. */
     settings.slab_chunk_size_max = settings.slab_page_size / 2;
     settings.sasl = false;
     settings.maxconns_fast = true;
@@ -303,6 +303,7 @@ static void settings_init(void) {
     settings.warm_lru_pct = 40;
     settings.hot_max_factor = 0.2;
     settings.warm_max_factor = 2.0;
+    settings.inline_ascii_response = false;
     settings.temp_lru = false;
     settings.temporary_ttl = 61;
     settings.idle_timeout = 0; /* disabled */
@@ -319,19 +320,62 @@ static void settings_init(void) {
     settings.logger_watcher_buf_size = LOGGER_WATCHER_BUF_SIZE;
     settings.logger_buf_size = LOGGER_BUF_SIZE;
     settings.drop_privileges = false;
-    settings.watch_enabled = true;
-    settings.resp_obj_mem_limit = 0;
-    settings.read_buf_mem_limit = 0;
 #ifdef MEMCACHED_DEBUG
     settings.relaxed_privileges = false;
 #endif
+}
+
+/*
+ * Adds a message header to a connection.
+ *
+ * Returns 0 on success, -1 on out-of-memory.
+ */
+static int add_msghdr(conn *c)
+{
+    struct msghdr *msg;
+
+    assert(c != NULL);
+
+    if (c->msgsize == c->msgused) {
+        msg = realloc(c->msglist, c->msgsize * 2 * sizeof(struct msghdr));
+        if (! msg) {
+            STATS_LOCK();
+            stats.malloc_fails++;
+            STATS_UNLOCK();
+            return -1;
+        }
+        c->msglist = msg;
+        c->msgsize *= 2;
+    }
+
+    msg = c->msglist + c->msgused;
+
+    /* this wipes msg_iovlen, msg_control, msg_controllen, and
+       msg_flags, the last 3 of which aren't defined on solaris: */
+    memset(msg, 0, sizeof(struct msghdr));
+
+    msg->msg_iov = &c->iov[c->iovused];
+
+    if (IS_UDP(c->transport) && c->request_addr_size > 0) {
+        msg->msg_name = &c->request_addr;
+        msg->msg_namelen = c->request_addr_size;
+    }
+
+    c->msgbytes = 0;
+    c->msgused++;
+
+    if (IS_UDP(c->transport)) {
+        /* Leave room for the UDP header, which we'll fill in later. */
+        return add_iov(c, NULL, UDP_HEADER_SIZE);
+    }
+
+    return 0;
 }
 
 extern pthread_mutex_t conn_lock;
 
 /* Connection timeout thread bits */
 static pthread_t conn_timeout_tid;
-static int do_run_conn_timeout_thread;
 
 #define CONNS_PER_SLICE 100
 #define TIMEOUT_MSG_SIZE (1 + sizeof(int))
@@ -343,7 +387,7 @@ static void *conn_timeout_thread(void *arg) {
     int sleep_time;
     useconds_t timeslice = 1000000 / (max_fds / CONNS_PER_SLICE);
 
-    while(do_run_conn_timeout_thread) {
+    while(1) {
         if (settings.verbose > 2)
             fprintf(stderr, "idle timeout thread at top of connection list\n");
 
@@ -401,7 +445,6 @@ static int start_conn_timeout_thread() {
     if (settings.idle_timeout == 0)
         return -1;
 
-    do_run_conn_timeout_thread = 1;
     if ((ret = pthread_create(&conn_timeout_tid, NULL,
         conn_timeout_thread, NULL)) != 0) {
         fprintf(stderr, "Can't create idle connection timeout thread: %s\n",
@@ -410,65 +453,6 @@ static int start_conn_timeout_thread() {
     }
 
     return 0;
-}
-
-int stop_conn_timeout_thread(void) {
-    if (!do_run_conn_timeout_thread)
-        return -1;
-    do_run_conn_timeout_thread = 0;
-    pthread_join(conn_timeout_tid, NULL);
-    return 0;
-}
-
-/*
- * read buffer cache helper functions
- */
-static void rbuf_release(conn *c) {
-    if (c->rbuf != NULL && c->rbytes == 0 && !IS_UDP(c->transport)) {
-        if (c->rbuf_malloced) {
-            free(c->rbuf);
-            c->rbuf_malloced = false;
-        } else {
-            do_cache_free(c->thread->rbuf_cache, c->rbuf);
-        }
-        c->rsize = 0;
-        c->rbuf = NULL;
-        c->rcurr = NULL;
-    }
-}
-
-static bool rbuf_alloc(conn *c) {
-    if (c->rbuf == NULL) {
-        c->rbuf = do_cache_alloc(c->thread->rbuf_cache);
-        if (!c->rbuf) {
-            THR_STATS_LOCK(c);
-            c->thread->stats.read_buf_oom++;
-            THR_STATS_UNLOCK(c);
-            return false;
-        }
-        c->rsize = READ_BUFFER_SIZE;
-        c->rcurr = c->rbuf;
-    }
-    return true;
-}
-
-// Just for handling huge ASCII multigets.
-// The previous system was essentially the same; realloc'ing until big enough,
-// then realloc'ing back down after the request finished.
-static bool rbuf_switch_to_malloc(conn *c) {
-    // Might as well start with x2 and work from there.
-    size_t size = c->rsize * 2;
-    char *tmp = malloc(size);
-    if (!tmp)
-        return false;
-
-    do_cache_free(c->thread->rbuf_cache, c->rbuf);
-    memcpy(tmp, c->rcurr, c->rbytes);
-
-    c->rcurr = c->rbuf = tmp;
-    c->rsize = size;
-    c->rbuf_malloced = true;
-    return true;
 }
 
 /*
@@ -484,10 +468,6 @@ static bool rbuf_switch_to_malloc(conn *c) {
 static void conn_init(void) {
     /* We're unlikely to see an FD much higher than maxconns. */
     int next_fd = dup(1);
-    if (next_fd < 0) {
-        perror("Failed to duplicate file descriptor\n");
-        exit(1);
-    }
     int headroom = 10;      /* account for extra unexpected open FDs */
     struct rlimit rl;
 
@@ -539,9 +519,7 @@ void conn_close_idle(conn *c) {
         if (settings.verbose > 1)
             fprintf(stderr, "Closing idle fd %d\n", c->sfd);
 
-        pthread_mutex_lock(&c->thread->stats.mutex);
         c->thread->stats.idle_kicks++;
-        pthread_mutex_unlock(&c->thread->stats.mutex);
 
         conn_set_state(c, conn_closing);
         drive_machine(c);
@@ -553,19 +531,12 @@ void conn_worker_readd(conn *c) {
     c->ev_flags = EV_READ | EV_PERSIST;
     event_set(&c->event, c->sfd, c->ev_flags, event_handler, (void *)c);
     event_base_set(c->thread->base, &c->event);
+    c->state = conn_new_cmd;
 
     // TODO: call conn_cleanup/fail/etc
     if (event_add(&c->event, 0) == -1) {
         perror("event_add");
     }
-
-    // side thread wanted us to close immediately.
-    if (c->state == conn_closing) {
-        drive_machine(c);
-        return;
-    }
-    c->state = conn_new_cmd;
-
 #ifdef EXTSTORE
     // If we had IO objects, process
     if (c->io_wraplist) {
@@ -597,16 +568,30 @@ conn *conn_new(const int sfd, enum conn_states init_state,
         c->read = NULL;
         c->sendmsg = NULL;
         c->write = NULL;
-        c->rbuf = NULL;
+        c->rbuf = c->wbuf = 0;
+        c->ilist = 0;
+        c->suffixlist = 0;
+        c->iov = 0;
+        c->msglist = 0;
+        c->hdrbuf = 0;
 
         c->rsize = read_buffer_size;
+        c->wsize = DATA_BUFFER_SIZE;
+        c->isize = ITEM_LIST_INITIAL;
+        c->suffixsize = SUFFIX_LIST_INITIAL;
+        c->iovsize = IOV_LIST_INITIAL;
+        c->msgsize = MSG_LIST_INITIAL;
+        c->hdrsize = 0;
 
-        // UDP connections use a persistent static buffer.
-        if (c->rsize) {
-            c->rbuf = (char *)malloc((size_t)c->rsize);
-        }
+        c->rbuf = (char *)malloc((size_t)c->rsize);
+        c->wbuf = (char *)malloc((size_t)c->wsize);
+        c->ilist = (item **)malloc(sizeof(item *) * c->isize);
+        c->suffixlist = (char **)malloc(sizeof(char *) * c->suffixsize);
+        c->iov = (struct iovec *)malloc(sizeof(struct iovec) * c->iovsize);
+        c->msglist = (struct msghdr *)malloc(sizeof(struct msghdr) * c->msgsize);
 
-        if (c->rsize && c->rbuf == NULL) {
+        if (c->rbuf == 0 || c->wbuf == 0 || c->ilist == 0 || c->iov == 0 ||
+                c->msglist == 0 || c->suffixlist == 0) {
             conn_free(c);
             STATS_LOCK();
             stats.malloc_fails++;
@@ -662,7 +647,6 @@ conn *conn_new(const int sfd, enum conn_states init_state,
             assert(false);
         }
     }
-
 #ifdef TLS
     c->ssl = NULL;
     c->ssl_wbuf = NULL;
@@ -671,20 +655,27 @@ conn *conn_new(const int sfd, enum conn_states init_state,
     c->state = init_state;
     c->rlbytes = 0;
     c->cmd = -1;
-    c->rbytes = 0;
+    c->rbytes = c->wbytes = 0;
+    c->wcurr = c->wbuf;
     c->rcurr = c->rbuf;
     c->ritem = 0;
-    c->rbuf_malloced = false;
+    c->icurr = c->ilist;
+    c->suffixcurr = c->suffixlist;
+    c->ileft = 0;
+    c->suffixleft = 0;
+    c->iovused = 0;
+    c->msgcurr = 0;
+    c->msgused = 0;
     c->sasl_started = false;
-    c->set_stale = false;
-    c->mset_res = false;
-    c->close_after_write = false;
+    c->authenticated = false;
     c->last_cmd_time = current_time; /* initialize for idle kicker */
 #ifdef EXTSTORE
     c->io_wraplist = NULL;
     c->io_wrapleft = 0;
 #endif
 
+    c->write_and_go = init_state;
+    c->write_and_free = 0;
     c->item = 0;
 
     c->noreply = false;
@@ -706,30 +697,6 @@ conn *conn_new(const int sfd, enum conn_states init_state,
         c->read = tcp_read;
         c->sendmsg = tcp_sendmsg;
         c->write = tcp_write;
-    }
-
-    if (IS_UDP(transport)) {
-        c->try_read_command = try_read_command_udp;
-    } else {
-        switch (c->protocol) {
-            case ascii_prot:
-                if (settings.auth_file == NULL) {
-                    c->authenticated = true;
-                    c->try_read_command = try_read_command_ascii;
-                } else {
-                    c->authenticated = false;
-                    c->try_read_command = try_read_command_asciiauth;
-                }
-                break;
-            case binary_prot:
-                // binprot handles its own authentication via SASL parsing.
-                c->authenticated = false;
-                c->try_read_command = try_read_command_binary;
-                break;
-            case negotiating_prot:
-                c->try_read_command = try_read_command_negotiate;
-                break;
-        }
     }
 
     event_set(&c->event, sfd, event_flags, event_handler, (void *)c);
@@ -825,50 +792,44 @@ static void conn_release_items(conn *c) {
         c->item = 0;
     }
 
+    while (c->ileft > 0) {
+        item *it = *(c->icurr);
+        assert((it->it_flags & ITEM_SLABBED) == 0);
+        item_remove(it);
+        c->icurr++;
+        c->ileft--;
+    }
+
+    if (c->suffixleft != 0) {
+        for (; c->suffixleft > 0; c->suffixleft--, c->suffixcurr++) {
+            do_cache_free(c->thread->suffix_cache, *(c->suffixcurr));
+        }
+    }
 #ifdef EXTSTORE
     if (c->io_wraplist) {
         io_wrap *tmp = c->io_wraplist;
         while (tmp) {
             io_wrap *next = tmp->next;
             recache_or_free(c, tmp);
-            // malloc'ed iovec list used for chunked extstore fetches.
-            if (tmp->io.iov) {
-                free(tmp->io.iov);
-                tmp->io.iov = NULL;
-            }
             do_cache_free(c->thread->io_cache, tmp); // lockless
             tmp = next;
         }
         c->io_wraplist = NULL;
     }
 #endif
-
-    // Cull any unsent responses.
-    if (c->resp_head) {
-        mc_resp *resp = c->resp_head;
-        // r_f() handles the chain maintenance.
-        while (resp) {
-            // temporary by default. hide behind a debug flag in the future:
-            // double free detection. Transmit loops can drop out early, but
-            // here we could infinite loop.
-            if (resp->free) {
-                fprintf(stderr, "ERROR: double free detected during conn_release_items(): [%d] [%s]\n",
-                        c->sfd, c->protocol == binary_prot ? "binary" : "ascii");
-                // Since this is a critical failure, just leak the memory.
-                // If these errors are seen, an abort() can be used instead.
-                c->resp_head = NULL;
-                c->resp = NULL;
-                break;
-            }
-            resp = resp_finish(c, resp);
-        }
-    }
+    c->icurr = c->ilist;
+    c->suffixcurr = c->suffixlist;
 }
 
 static void conn_cleanup(conn *c) {
     assert(c != NULL);
 
     conn_release_items(c);
+
+    if (c->write_and_free) {
+        free(c->write_and_free);
+        c->write_and_free = 0;
+    }
 
     if (c->sasl_conn) {
         assert(settings.sasl);
@@ -891,8 +852,20 @@ void conn_free(conn *c) {
 
         MEMCACHED_CONN_DESTROY(c);
         conns[c->sfd] = NULL;
+        if (c->hdrbuf)
+            free(c->hdrbuf);
+        if (c->msglist)
+            free(c->msglist);
         if (c->rbuf)
             free(c->rbuf);
+        if (c->wbuf)
+            free(c->wbuf);
+        if (c->ilist)
+            free(c->ilist);
+        if (c->suffixlist)
+            free(c->suffixlist);
+        if (c->iov)
+            free(c->iov);
 #ifdef TLS
         if (c->ssl_wbuf)
             c->ssl_wbuf = NULL;
@@ -913,12 +886,6 @@ static void conn_close(conn *c) {
 
     conn_cleanup(c);
 
-    // force release of read buffer.
-    if (c->thread) {
-        c->rbytes = 0;
-        rbuf_release(c);
-    }
-
     MEMCACHED_CONN_RELEASE(c->sfd);
     conn_set_state(c, conn_closed);
 #ifdef TLS
@@ -937,6 +904,64 @@ static void conn_close(conn *c) {
     STATS_UNLOCK();
 
     return;
+}
+
+/*
+ * Shrinks a connection's buffers if they're too big.  This prevents
+ * periodic large "get" requests from permanently chewing lots of server
+ * memory.
+ *
+ * This should only be called in between requests since it can wipe output
+ * buffers!
+ */
+static void conn_shrink(conn *c) {
+    assert(c != NULL);
+
+    if (IS_UDP(c->transport))
+        return;
+
+    if (c->rsize > READ_BUFFER_HIGHWAT && c->rbytes < DATA_BUFFER_SIZE) {
+        char *newbuf;
+
+        if (c->rcurr != c->rbuf)
+            memmove(c->rbuf, c->rcurr, (size_t)c->rbytes);
+
+        newbuf = (char *)realloc((void *)c->rbuf, DATA_BUFFER_SIZE);
+
+        if (newbuf) {
+            c->rbuf = newbuf;
+            c->rsize = DATA_BUFFER_SIZE;
+        }
+        /* TODO check other branch... */
+        c->rcurr = c->rbuf;
+    }
+
+    if (c->isize > ITEM_LIST_HIGHWAT) {
+        item **newbuf = (item**) realloc((void *)c->ilist, ITEM_LIST_INITIAL * sizeof(c->ilist[0]));
+        if (newbuf) {
+            c->ilist = newbuf;
+            c->isize = ITEM_LIST_INITIAL;
+        }
+    /* TODO check error condition? */
+    }
+
+    if (c->msgsize > MSG_LIST_HIGHWAT) {
+        struct msghdr *newbuf = (struct msghdr *) realloc((void *)c->msglist, MSG_LIST_INITIAL * sizeof(c->msglist[0]));
+        if (newbuf) {
+            c->msglist = newbuf;
+            c->msgsize = MSG_LIST_INITIAL;
+        }
+    /* TODO check error condition? */
+    }
+
+    if (c->iovsize > IOV_LIST_HIGHWAT) {
+        struct iovec *newbuf = (struct iovec *) realloc((void *)c->iov, IOV_LIST_INITIAL * sizeof(c->iov[0]));
+        if (newbuf) {
+            c->iov = newbuf;
+            c->iovsize = IOV_LIST_INITIAL;
+        }
+    /* TODO check return value */
+    }
 }
 
 /**
@@ -975,123 +1000,188 @@ static void conn_set_state(conn *c, enum conn_states state) {
         }
 
         if (state == conn_write || state == conn_mwrite) {
-            MEMCACHED_PROCESS_COMMAND_END(c->sfd, c->resp->wbuf, c->resp->wbytes);
+            MEMCACHED_PROCESS_COMMAND_END(c->sfd, c->wbuf, c->wbytes);
         }
         c->state = state;
     }
 }
 
 /*
- * response object helper functions
+ * Ensures that there is room for another struct iovec in a connection's
+ * iov list.
+ *
+ * Returns 0 on success, -1 on out-of-memory.
  */
-static void resp_reset(mc_resp *resp) {
-    if (resp->item) {
-        item_remove(resp->item);
-        resp->item = NULL;
+static int ensure_iov_space(conn *c) {
+    assert(c != NULL);
+
+    if (c->iovused >= c->iovsize) {
+        int i, iovnum;
+        struct iovec *new_iov = (struct iovec *)realloc(c->iov,
+                                (c->iovsize * 2) * sizeof(struct iovec));
+        if (! new_iov) {
+            STATS_LOCK();
+            stats.malloc_fails++;
+            STATS_UNLOCK();
+            return -1;
+        }
+        c->iov = new_iov;
+        c->iovsize *= 2;
+
+        /* Point all the msghdr structures at the new list. */
+        for (i = 0, iovnum = 0; i < c->msgused; i++) {
+            c->msglist[i].msg_iov = &c->iov[iovnum];
+            iovnum += c->msglist[i].msg_iovlen;
+        }
     }
-    if (resp->write_and_free) {
-        free(resp->write_and_free);
-        resp->write_and_free = NULL;
-    }
-    resp->wbytes = 0;
-    resp->tosend = 0;
-    resp->iovcnt = 0;
-    resp->chunked_data_iov = 0;
-    resp->chunked_total = 0;
-    resp->skip = false;
+
+    return 0;
 }
 
-static void resp_add_iov(mc_resp *resp, const void *buf, int len) {
-    assert(resp->iovcnt < MC_RESP_IOVCOUNT);
-    int x = resp->iovcnt;
-    resp->iov[x].iov_base = (void *)buf;
-    resp->iov[x].iov_len = len;
-    resp->iovcnt++;
-    resp->tosend += len;
-}
 
-// Notes that an IOV should be handled as a chunked item header.
-// TODO: I'm hoping this isn't a permanent abstraction while I learn what the
-// API should be.
-static void resp_add_chunked_iov(mc_resp *resp, const void *buf, int len) {
-    resp->chunked_data_iov = resp->iovcnt;
-    resp->chunked_total = len;
-    resp_add_iov(resp, buf, len);
-}
+/*
+ * Adds data to the list of pending data that will be written out to a
+ * connection.
+ *
+ * Returns 0 on success, -1 on out-of-memory.
+ * Note: This is a hot path for at least ASCII protocol. While there is
+ * redundant code in splitting TCP/UDP handling, any reduction in steps has a
+ * large impact for TCP connections.
+ */
 
-static bool resp_start(conn *c) {
-    mc_resp *resp = do_cache_alloc(c->thread->resp_cache);
-    if (!resp) {
-        THR_STATS_LOCK(c);
-        c->thread->stats.response_obj_oom++;
-        THR_STATS_UNLOCK(c);
-        return false;
-    }
-    // FIXME: make wbuf indirect or use offsetof to zero up until wbuf
-    memset(resp, 0, sizeof(*resp));
-    if (!c->resp_head) {
-        c->resp_head = resp;
-    }
-    if (!c->resp) {
-        c->resp = resp;
-    } else {
-        c->resp->next = resp;
-        c->resp = resp;
-    }
+static int add_iov(conn *c, const void *buf, int len) {
+    struct msghdr *m;
+    int leftover;
+	//fprintf(stderr, "add_iov %s\n", (char *)buf);
+    assert(c != NULL);
+
     if (IS_UDP(c->transport)) {
-        // need to hold on to some data for async responses.
-        c->resp->request_id = c->request_id;
-        c->resp->request_addr = c->request_addr;
-        c->resp->request_addr_size = c->request_addr_size;
+        do {
+            m = &c->msglist[c->msgused - 1];
+
+            /*
+             * Limit UDP packets to UDP_MAX_PAYLOAD_SIZE bytes.
+             */
+
+            /* We may need to start a new msghdr if this one is full. */
+            if (m->msg_iovlen == IOV_MAX ||
+                (c->msgbytes >= UDP_MAX_PAYLOAD_SIZE)) {
+                add_msghdr(c);
+                m = &c->msglist[c->msgused - 1];
+            }
+
+            if (ensure_iov_space(c) != 0)
+                return -1;
+
+            /* If the fragment is too big to fit in the datagram, split it up */
+            if (len + c->msgbytes > UDP_MAX_PAYLOAD_SIZE) {
+                leftover = len + c->msgbytes - UDP_MAX_PAYLOAD_SIZE;
+                len -= leftover;
+            } else {
+                leftover = 0;
+            }
+
+            m = &c->msglist[c->msgused - 1];
+            m->msg_iov[m->msg_iovlen].iov_base = (void *)buf;
+            m->msg_iov[m->msg_iovlen].iov_len = len;
+
+            c->msgbytes += len;
+            c->iovused++;
+            m->msg_iovlen++;
+
+            buf = ((char *)buf) + len;
+            len = leftover;
+        } while (leftover > 0);
+    } else {
+        /* Optimized path for TCP connections */
+        m = &c->msglist[c->msgused - 1];
+        if (m->msg_iovlen == IOV_MAX) {
+            add_msghdr(c);
+            m = &c->msglist[c->msgused - 1];
+        }
+
+        if (ensure_iov_space(c) != 0)
+            return -1;
+
+        m->msg_iov[m->msg_iovlen].iov_base = (void *)buf;
+        m->msg_iov[m->msg_iovlen].iov_len = len;
+        c->msgbytes += len;
+        c->iovused++;
+        m->msg_iovlen++;
     }
-    return true;
+
+    return 0;
 }
 
-// returns next response in chain.
-static mc_resp* resp_finish(conn *c, mc_resp *resp) {
-    mc_resp *next = resp->next;
-    if (resp->item) {
-        // TODO: cache hash value in resp obj?
-        item_remove(resp->item);
-        resp->item = NULL;
+static int add_chunked_item_iovs(conn *c, item *it, int len) {
+    assert(it->it_flags & ITEM_CHUNKED);
+    item_chunk *ch = (item_chunk *) ITEM_schunk(it);
+    while (ch) {
+        int todo = (len > ch->used) ? ch->used : len;
+        if (add_iov(c, ch->data, todo) != 0) {
+            return -1;
+        }
+        ch = ch->next;
+        len -= todo;
     }
-    if (resp->write_and_free) {
-        free(resp->write_and_free);
-    }
-    if (c->resp_head == resp) {
-        c->resp_head = next;
-    }
-    if (c->resp == resp) {
-        c->resp = NULL;
-    }
-    resp->free = true;
-    do_cache_free(c->thread->resp_cache, resp);
-    return next;
+    return 0;
 }
 
-// tells if connection has a depth of response objects to process.
-static bool resp_has_stack(conn *c) {
-    return c->resp_head->next != NULL ? true : false;
+/*
+ * Constructs a set of UDP headers and attaches them to the outgoing messages.
+ */
+static int build_udp_headers(conn *c) {
+    int i;
+    unsigned char *hdr;
+
+    assert(c != NULL);
+
+    if (c->msgused > c->hdrsize) {
+        void *new_hdrbuf;
+        if (c->hdrbuf) {
+            new_hdrbuf = realloc(c->hdrbuf, c->msgused * 2 * UDP_HEADER_SIZE);
+        } else {
+            new_hdrbuf = malloc(c->msgused * 2 * UDP_HEADER_SIZE);
+        }
+
+        if (! new_hdrbuf) {
+            STATS_LOCK();
+            stats.malloc_fails++;
+            STATS_UNLOCK();
+            return -1;
+        }
+        c->hdrbuf = (unsigned char *)new_hdrbuf;
+        c->hdrsize = c->msgused * 2;
+    }
+
+    hdr = c->hdrbuf;
+    for (i = 0; i < c->msgused; i++) {
+        c->msglist[i].msg_iov[0].iov_base = (void*)hdr;
+        c->msglist[i].msg_iov[0].iov_len = UDP_HEADER_SIZE;
+        *hdr++ = c->request_id / 256;
+        *hdr++ = c->request_id % 256;
+        *hdr++ = i / 256;
+        *hdr++ = i % 256;
+        *hdr++ = c->msgused / 256;
+        *hdr++ = c->msgused % 256;
+        *hdr++ = 0;
+        *hdr++ = 0;
+        assert((void *) hdr == (caddr_t)c->msglist[i].msg_iov[0].iov_base + UDP_HEADER_SIZE);
+    }
+
+    return 0;
 }
+
 
 static void out_string(conn *c, const char *str) {
     size_t len;
-    mc_resp *resp = c->resp;
 
     assert(c != NULL);
-    // if response was original filled with something, but we're now writing
-    // out an error or similar, have to reset the object first.
-    // TODO: since this is often redundant with allocation, how many callers
-    // are actually requiring it be reset? Can we fast test by just looking at
-    // tosend and reset if nonzero?
-    resp_reset(resp);
 
     if (c->noreply) {
-        // TODO: just invalidate the response since nothing's been attempted
-        // to send yet?
-        resp->skip = true;
         if (settings.verbose > 1)
             fprintf(stderr, ">%d NOREPLY %s\n", c->sfd, str);
+        c->noreply = false;
         conn_set_state(c, conn_new_cmd);
         return;
     }
@@ -1099,28 +1189,27 @@ static void out_string(conn *c, const char *str) {
     if (settings.verbose > 1)
         fprintf(stderr, ">%d %s\n", c->sfd, str);
 
-    // Fill response object with static string.
+    /* Nuke a partial output... */
+    c->msgcurr = 0;
+    c->msgused = 0;
+    c->iovused = 0;
+    add_msghdr(c);
 
     len = strlen(str);
-    if ((len + 2) > WRITE_BUFFER_SIZE) {
+    if ((len + 2) > c->wsize) {
         /* ought to be always enough. just fail for simplicity */
         str = "SERVER_ERROR output line too long";
         len = strlen(str);
     }
 
-    memcpy(resp->wbuf, str, len);
-    memcpy(resp->wbuf + len, "\r\n", 2);
-    resp_add_iov(resp, resp->wbuf, len + 2);
+    memcpy(c->wbuf, str, len);
+    memcpy(c->wbuf + len, "\r\n", 2);
+    c->wbytes = len + 2;
+    c->wcurr = c->wbuf;
 
-    conn_set_state(c, conn_new_cmd);
+    conn_set_state(c, conn_write);
+    c->write_and_go = conn_new_cmd;
     return;
-}
-
-// For metaget-style ASCII commands. Ignores noreply, ensuring clients see
-// protocol level errors.
-static void out_errstring(conn *c, const char *str) {
-    c->noreply = false;
-    out_string(c, str);
 }
 
 /*
@@ -1150,10 +1239,14 @@ static void complete_nread_ascii(conn *c) {
     assert(c != NULL);
 
     item *it = c->item;
+  //  fprintf(stderr, "%s %s\n", ITEM_key(it), ITEM_data(it));
     int comm = c->cmd;
     enum store_item_type ret;
     bool is_valid = false;
-
+    /*if(c->cmd == NREAD_REPLACE){
+	replace_count++;
+	fprintf(stderr, "replace %d\n", replace_count);
+    }*/
     pthread_mutex_lock(&c->thread->stats.mutex);
     c->thread->stats.slab_stats[ITEM_clsid(it)].set_cmds++;
     pthread_mutex_unlock(&c->thread->stats.mutex);
@@ -1187,14 +1280,13 @@ static void complete_nread_ascii(conn *c) {
     }
 
     if (!is_valid) {
-        // metaset mode always returns errors.
-        if (c->mset_res) {
-            c->noreply = false;
-        }
         out_string(c, "CLIENT_ERROR bad data chunk");
     } else {
+      //if(c->cmd == NREAD_REPLACE)
+	//fprintf(stderr, "BEFORE KEY %s DATA %s\n",ITEM_key(it), ITEM_data(it));
       ret = store_item(it, comm, c);
-
+      //if(c->cmd == NREAD_REPLACE)
+	//fprintf(stderr, "AFTER KEY %s DATA %s\n",ITEM_key(it), ITEM_data(it));
 #ifdef ENABLE_DTRACE
       uint64_t cas = ITEM_get_cas(it);
       switch (c->cmd) {
@@ -1225,57 +1317,102 @@ static void complete_nread_ascii(conn *c) {
       }
 #endif
 
-      if (c->mset_res) {
-          // Replace the status code in the response.
-          // Rest was prepared during mset parsing.
-          mc_resp *resp = c->resp;
-          conn_set_state(c, conn_new_cmd);
-          switch (ret) {
-          case STORED:
-              memcpy(resp->wbuf, "OK ", 3);
-              // Only place noreply is used for meta cmds is a nominal response.
-              if (c->noreply) {
-                  resp->skip = true;
-              }
-              break;
-          case EXISTS:
-              memcpy(resp->wbuf, "EX ", 3);
-              break;
-          case NOT_FOUND:
-              memcpy(resp->wbuf, "NF ", 3);
-              break;
-          case NOT_STORED:
-              memcpy(resp->wbuf, "NS ", 3);
-              break;
-          default:
-              c->noreply = false;
-              out_string(c, "SERVER_ERROR Unhandled storage type.");
-          }
-      } else {
-          switch (ret) {
-          case STORED:
-              out_string(c, "STORED");
-              break;
-          case EXISTS:
-              out_string(c, "EXISTS");
-              break;
-          case NOT_FOUND:
-              out_string(c, "NOT_FOUND");
-              break;
-          case NOT_STORED:
-              out_string(c, "NOT_STORED");
-              break;
-          default:
-              out_string(c, "SERVER_ERROR Unhandled storage type.");
-          }
+      switch (ret) {
+      case STORED:
+          out_string(c, "STORED");
+	  //end of set
+          /*TX_BEGIN(settings.pm_pool){
+            pmemobj_tx_add_range_direct(it, sizeof(it));
+            pmemobj_tx_add_range_direct(ITEM_data(it), it->nbytes);
+            pmemobj_tx_add_range_direct(ITEM_key(it), it->nkey);
+          }TX_ONABORT{
+            printf("abortion in insertion: %s\n", pmemobj_errormsg());
+          }TX_END*/
+	  //clock_t end = clock();
+	  //double time_here = (double)(end-start)/CLOCKS_PER_SEC;
+	  //set_count++;
+	 //times_count++;
+	/*latency_times[set_count - 1] = time_here;
+	 if(set_count == 9900000){
+			fprintf(stderr, "BEGIN\n");
+                        for(int ind = 0; ind < 9900000; ind++){
+                                fprintf(out_file, "%f\n", latency_times[ind] * 1000000);
+                        }
+			fclose(out_file);
+			fprintf(stderr, "END\n");
+                }*/
+          //fprintf(stderr, "%f\n", time_here);
+	  /*if(set_count % 100 == 0){
+		times[times_count] = (double)(end - set_start)/ CLOCKS_PER_SEC;
+		times_count++;
+	 //fprintf(stderr, "%d\n", set_count);
+
+	  }*/
+	/*if(set_count == 9900000){
+                fprintf(stderr, "BEGIN\n");
+                for(int ind = 1; ind < times_count; ind++){
+                                fprintf(out_file, "%f\n", 100/(times[ind] - (times[ind - 1])));
+                        }
+                        fclose(out_file);
+                        fprintf(stderr, "END\n");
+                        //fclose(out_file);
+                }*/
+	//fprintf(stderr, "%d\n", set_count);
+	  /*if(set_count == 10000000){
+                fprintf(stderr, "BEGIN\n");
+                //double tp[50000000];
+                //double tp[times_count];
+                for(int ind = 1; ind < times_count; ind++){
+                        fprintf(out_file, "%f\n", 100/(times[ind] - (times[ind - 1])));
+                }
+                fclose(out_file);
+                //fclose(out_file);
+          }*/
+	  /*if(set_count == 50000000){
+	  	for(int ind = 0; ind < times_count; ind++){
+			fprintf(out_file, "%d,%f\n", ind * 100, times[ind]);
+		}
+		double total = 0;
+		double average = 0;
+		for(int ind = 1; ind < times_count; ind++){
+			double t = 100/(times[ind]-times[ind-1]);
+			total += t;
+			//fprintf(out_file, "%f\n", t);
+		}
+		average = total/times_count;
+		fprintf(stderr, "average is %f\n", average);
+		//fclose(out_file);
+	  }*/
+          break;
+      case EXISTS:
+          out_string(c, "EXISTS");
+          break;
+      case NOT_FOUND:
+          out_string(c, "NOT_FOUND");
+          break;
+      case NOT_STORED:
+          out_string(c, "NOT_STORED");
+          break;
+      default:
+          out_string(c, "SERVER_ERROR Unhandled storage type.");
       }
 
     }
 
-    c->set_stale = false; /* force flag to be off just in case */
-    c->mset_res = false;
     item_remove(c->item);       /* release the c->item reference */
     c->item = 0;
+}
+
+/**
+ * get a pointer to the start of the request struct for the current command
+ */
+static void* binary_get_request(conn *c) {
+    char *ret = c->rcurr;
+    ret -= (sizeof(c->binary_header) + c->binary_header.request.keylen +
+            c->binary_header.request.extlen);
+
+    assert(ret >= c->rbuf);
+    return ret;
 }
 
 /**
@@ -1287,13 +1424,21 @@ static char* binary_get_key(conn *c) {
 
 static void add_bin_header(conn *c, uint16_t err, uint8_t hdr_len, uint16_t key_len, uint32_t body_len) {
     protocol_binary_response_header* header;
-    mc_resp *resp = c->resp;
 
     assert(c);
 
-    resp_reset(resp);
+    c->msgcurr = 0;
+    c->msgused = 0;
+    c->iovused = 0;
+    if (add_msghdr(c) != 0) {
+        /* This should never run out of memory because iov and msg lists
+         * have minimum sizes big enough to hold an error response.
+         */
+        out_of_memory(c, "SERVER_ERROR out of memory adding binary header");
+        return;
+    }
 
-    header = (protocol_binary_response_header *)resp->wbuf;
+    header = (protocol_binary_response_header *)c->wbuf;
 
     header->response.magic = (uint8_t)PROTOCOL_BINARY_RES;
     header->response.opcode = c->binary_header.request.opcode;
@@ -1319,8 +1464,7 @@ static void add_bin_header(conn *c, uint16_t err, uint8_t hdr_len, uint16_t key_
         fprintf(stderr, "\n");
     }
 
-    resp->wbytes = sizeof(header->response);
-    resp_add_iov(resp, resp->wbuf, resp->wbytes);
+    add_iov(c, c->wbuf, sizeof(header->response));
 }
 
 /**
@@ -1375,13 +1519,14 @@ static void write_bin_error(conn *c, protocol_binary_response_status err,
     len = strlen(errstr);
     add_bin_header(c, err, 0, 0, len);
     if (len > 0) {
-        resp_add_iov(c->resp, errstr, len);
+        add_iov(c, errstr, len);
     }
-    if (swallow > 0) {
+    conn_set_state(c, conn_mwrite);
+    if(swallow > 0) {
         c->sbytes = swallow;
-        conn_set_state(c, conn_swallow);
+        c->write_and_go = conn_swallow;
     } else {
-        conn_set_state(c, conn_mwrite);
+        c->write_and_go = conn_new_cmd;
     }
 }
 
@@ -1390,16 +1535,17 @@ static void write_bin_response(conn *c, void *d, int hlen, int keylen, int dlen)
     if (!c->noreply || c->cmd == PROTOCOL_BINARY_CMD_GET ||
         c->cmd == PROTOCOL_BINARY_CMD_GETK) {
         add_bin_header(c, 0, hlen, keylen, dlen);
-        mc_resp *resp = c->resp;
-        if (dlen > 0) {
-            resp_add_iov(resp, d, dlen);
+        if(dlen > 0) {
+            add_iov(c, d, dlen);
         }
+        conn_set_state(c, conn_mwrite);
+        c->write_and_go = conn_new_cmd;
+    } else {
+        conn_set_state(c, conn_new_cmd);
     }
-
-    conn_set_state(c, conn_new_cmd);
 }
 
-static void complete_incr_bin(conn *c, char *extbuf) {
+static void complete_incr_bin(conn *c) {
     item *it;
     char *key;
     size_t nkey;
@@ -1407,11 +1553,11 @@ static void complete_incr_bin(conn *c, char *extbuf) {
     char tmpbuf[INCR_MAX_STORAGE_LEN];
     uint64_t cas = 0;
 
-    protocol_binary_response_incr* rsp = (protocol_binary_response_incr*)c->resp->wbuf;
-    protocol_binary_request_incr* req = (void *)extbuf;
+    protocol_binary_response_incr* rsp = (protocol_binary_response_incr*)c->wbuf;
+    protocol_binary_request_incr* req = binary_get_request(c);
 
     assert(c != NULL);
-    //assert(c->wsize >= sizeof(*rsp));
+    assert(c->wsize >= sizeof(*rsp));
 
     /* fix byteorder in the request */
     req->message.body.delta = ntohll(req->message.body.delta);
@@ -1504,6 +1650,7 @@ static void complete_update_bin(conn *c) {
     assert(c != NULL);
 
     item *it = c->item;
+
     pthread_mutex_lock(&c->thread->stats.mutex);
     c->thread->stats.slab_stats[ITEM_clsid(it)].set_cmds++;
     pthread_mutex_unlock(&c->thread->stats.mutex);
@@ -1582,22 +1729,23 @@ static void complete_update_bin(conn *c) {
 
 static void write_bin_miss_response(conn *c, char *key, size_t nkey) {
     if (nkey) {
+        char *ofs = c->wbuf + sizeof(protocol_binary_response_header);
         add_bin_header(c, PROTOCOL_BINARY_RESPONSE_KEY_ENOENT,
                 0, nkey, nkey);
-        char *ofs = c->resp->wbuf + sizeof(protocol_binary_response_header);
         memcpy(ofs, key, nkey);
-        resp_add_iov(c->resp, ofs, nkey);
-        conn_set_state(c, conn_new_cmd);
+        add_iov(c, ofs, nkey);
+        conn_set_state(c, conn_mwrite);
+        c->write_and_go = conn_new_cmd;
     } else {
         write_bin_error(c, PROTOCOL_BINARY_RESPONSE_KEY_ENOENT,
                         NULL, 0);
     }
 }
 
-static void process_bin_get_or_touch(conn *c, char *extbuf) {
+static void process_bin_get_or_touch(conn *c) {
     item *it;
-
-    protocol_binary_response_get* rsp = (protocol_binary_response_get*)c->resp->wbuf;
+	fprintf(stderr, "process bin get or touch\n");
+    protocol_binary_response_get* rsp = (protocol_binary_response_get*)c->wbuf;
     char* key = binary_get_key(c);
     size_t nkey = c->binary_header.request.keylen;
     int should_touch = (c->cmd == PROTOCOL_BINARY_CMD_TOUCH ||
@@ -1615,7 +1763,7 @@ static void process_bin_get_or_touch(conn *c, char *extbuf) {
     }
 
     if (should_touch) {
-        protocol_binary_request_touch *t = (void *)extbuf;
+        protocol_binary_request_touch *t = binary_get_request(c);
         time_t exptime = ntohl(t->message.body.expiration);
 
         it = item_touch(key, nkey, realtime(exptime), c);
@@ -1657,19 +1805,26 @@ static void process_bin_get_or_touch(conn *c, char *extbuf) {
         rsp->message.header.response.cas = htonll(ITEM_get_cas(it));
 
         // add the flags
-        FLAGS_CONV(it, rsp->message.body.flags);
+        FLAGS_CONV(settings.inline_ascii_response, it, rsp->message.body.flags);
         rsp->message.body.flags = htonl(rsp->message.body.flags);
-        resp_add_iov(c->resp, &rsp->message.body, sizeof(rsp->message.body));
+        add_iov(c, &rsp->message.body, sizeof(rsp->message.body));
 
         if (should_return_key) {
-            resp_add_iov(c->resp, ITEM_key(it), nkey);
+            add_iov(c, ITEM_key(it), nkey);
         }
 
         if (should_return_value) {
             /* Add the data minus the CRLF */
 #ifdef EXTSTORE
             if (it->it_flags & ITEM_HDR) {
-                if (_get_extstore(c, it, c->resp) != 0) {
+                int iovcnt = 4;
+                int iovst = c->iovused - 3;
+                if (!should_return_key) {
+                    iovcnt = 3;
+                    iovst = c->iovused - 2;
+                }
+
+                if (_get_extstore(c, it, iovst, iovcnt) != 0) {
                     pthread_mutex_lock(&c->thread->stats.mutex);
                     c->thread->stats.get_oom_extstore++;
                     pthread_mutex_unlock(&c->thread->stats.mutex);
@@ -1677,32 +1832,32 @@ static void process_bin_get_or_touch(conn *c, char *extbuf) {
                     failed = true;
                 }
             } else if ((it->it_flags & ITEM_CHUNKED) == 0) {
-                resp_add_iov(c->resp, ITEM_data(it), it->nbytes - 2);
+                add_iov(c, ITEM_data(it), it->nbytes - 2);
             } else {
-                // Allow transmit handler to find the item and expand iov's
-                resp_add_chunked_iov(c->resp, it, it->nbytes - 2);
+                add_chunked_item_iovs(c, it, it->nbytes - 2);
             }
 #else
             if ((it->it_flags & ITEM_CHUNKED) == 0) {
-                resp_add_iov(c->resp, ITEM_data(it), it->nbytes - 2);
+                add_iov(c, ITEM_data(it), it->nbytes - 2);
             } else {
-                resp_add_chunked_iov(c->resp, it, it->nbytes - 2);
+                add_chunked_item_iovs(c, it, it->nbytes - 2);
             }
 #endif
         }
 
         if (!failed) {
-            conn_set_state(c, conn_new_cmd);
+            conn_set_state(c, conn_mwrite);
+            c->write_and_go = conn_new_cmd;
             /* Remember this command so we can garbage collect it later */
 #ifdef EXTSTORE
             if ((it->it_flags & ITEM_HDR) != 0 && should_return_value) {
                 // Only have extstore clean if header and returning value.
-                c->resp->item = NULL;
+                c->item = NULL;
             } else {
-                c->resp->item = it;
+                c->item = it;
             }
 #else
-            c->resp->item = it;
+            c->item = it;
 #endif
         } else {
             item_remove(it);
@@ -1831,7 +1986,7 @@ static void append_stats(const char *key, const uint16_t klen,
 {
     /* value without a key is invalid */
     if (klen == 0 && vlen > 0) {
-        return;
+        return ;
     }
 
     conn *c = (conn*)cookie;
@@ -1839,13 +1994,13 @@ static void append_stats(const char *key, const uint16_t klen,
     if (c->protocol == binary_prot) {
         size_t needed = vlen + klen + sizeof(protocol_binary_response_header);
         if (!grow_stats_buf(c, needed)) {
-            return;
+            return ;
         }
         append_bin_stats(key, klen, val, vlen, c);
     } else {
         size_t needed = vlen + klen + 10; // 10 == "STAT = \r\n"
         if (!grow_stats_buf(c, needed)) {
-            return;
+            return ;
         }
         append_ascii_stats(key, klen, val, vlen, c);
     }
@@ -1921,6 +2076,58 @@ static void process_bin_stat(conn *c) {
     }
 }
 
+static void bin_read_key(conn *c, enum bin_substates next_substate, int extra) {
+    assert(c);
+    c->substate = next_substate;
+    c->rlbytes = c->keylen + extra;
+
+    /* Ok... do we have room for the extras and the key in the input buffer? */
+    ptrdiff_t offset = c->rcurr + sizeof(protocol_binary_request_header) - c->rbuf;
+    if (c->rlbytes > c->rsize - offset) {
+        size_t nsize = c->rsize;
+        size_t size = c->rlbytes + sizeof(protocol_binary_request_header);
+
+        while (size > nsize) {
+            nsize *= 2;
+        }
+
+        if (nsize != c->rsize) {
+            if (settings.verbose > 1) {
+                fprintf(stderr, "%d: Need to grow buffer from %lu to %lu\n",
+                        c->sfd, (unsigned long)c->rsize, (unsigned long)nsize);
+            }
+            char *newm = realloc(c->rbuf, nsize);
+            if (newm == NULL) {
+                STATS_LOCK();
+                stats.malloc_fails++;
+                STATS_UNLOCK();
+                if (settings.verbose) {
+                    fprintf(stderr, "%d: Failed to grow buffer.. closing connection\n",
+                            c->sfd);
+                }
+                conn_set_state(c, conn_closing);
+                return;
+            }
+
+            c->rbuf= newm;
+            /* rcurr should point to the same offset in the packet */
+            c->rcurr = c->rbuf + offset - sizeof(protocol_binary_request_header);
+            c->rsize = nsize;
+        }
+        if (c->rbuf != c->rcurr) {
+            memmove(c->rbuf, c->rcurr, c->rbytes);
+            c->rcurr = c->rbuf;
+            if (settings.verbose > 1) {
+                fprintf(stderr, "%d: Repack input buffer\n", c->sfd);
+            }
+        }
+    }
+
+    /* preserve the header in the buffer.. */
+    c->ritem = c->rcurr + sizeof(protocol_binary_request_header);
+    conn_set_state(c, conn_nread);
+}
+
 /* Just write an error message and disconnect the client */
 static void handle_binary_protocol_error(conn *c) {
     write_bin_error(c, PROTOCOL_BINARY_RESPONSE_EINVAL, NULL, 0);
@@ -1928,7 +2135,7 @@ static void handle_binary_protocol_error(conn *c) {
         fprintf(stderr, "Protocol error (opcode %02x), close connection %d\n",
                 c->binary_header.request.opcode, c->sfd);
     }
-    c->close_after_write = true;
+    c->write_and_go = conn_closing;
 }
 
 static void init_sasl_conn(conn *c) {
@@ -1999,7 +2206,7 @@ static void process_bin_sasl_auth(conn *c) {
 
     if (nkey > MAX_SASL_MECH_LEN) {
         write_bin_error(c, PROTOCOL_BINARY_RESPONSE_EINVAL, NULL, vlen);
-        conn_set_state(c, conn_swallow);
+        c->write_and_go = conn_swallow;
         return;
     }
 
@@ -2011,10 +2218,7 @@ static void process_bin_sasl_auth(conn *c) {
     /* Can't use a chunked item for SASL authentication. */
     if (it == 0 || (it->it_flags & ITEM_CHUNKED)) {
         write_bin_error(c, PROTOCOL_BINARY_RESPONSE_ENOMEM, NULL, vlen);
-        conn_set_state(c, conn_swallow);
-        if (it) {
-            do_item_remove(it);
-        }
+        c->write_and_go = conn_swallow;
         return;
     }
 
@@ -2038,7 +2242,8 @@ static void process_bin_complete_sasl_auth(conn *c) {
 
     if (nkey > ((item*) c->item)->nkey) {
         write_bin_error(c, PROTOCOL_BINARY_RESPONSE_EINVAL, NULL, vlen);
-        conn_set_state(c, conn_swallow);
+        c->write_and_go = conn_swallow;
+        item_unlink(c->item);
         return;
     }
 
@@ -2053,7 +2258,8 @@ static void process_bin_complete_sasl_auth(conn *c) {
 
     if (vlen > ((item*) c->item)->nbytes) {
         write_bin_error(c, PROTOCOL_BINARY_RESPONSE_EINVAL, NULL, vlen);
-        conn_set_state(c, conn_swallow);
+        c->write_and_go = conn_swallow;
+        item_unlink(c->item);
         return;
     }
 
@@ -2089,6 +2295,8 @@ static void process_bin_complete_sasl_auth(conn *c) {
         break;
     }
 
+    item_unlink(c->item);
+
     if (settings.verbose) {
         fprintf(stderr, "sasl result code:  %d\n", result);
     }
@@ -2103,11 +2311,11 @@ static void process_bin_complete_sasl_auth(conn *c) {
         break;
     case SASL_CONTINUE:
         add_bin_header(c, PROTOCOL_BINARY_RESPONSE_AUTH_CONTINUE, 0, 0, outlen);
-        if (outlen > 0) {
-            resp_add_iov(c->resp, out, outlen);
+        if(outlen > 0) {
+            add_iov(c, out, outlen);
         }
-        // Immediately flush our write.
         conn_set_state(c, conn_mwrite);
+        c->write_and_go = conn_new_cmd;
         break;
     default:
         if (settings.verbose)
@@ -2143,7 +2351,7 @@ static bool authenticated(conn *c) {
     return rv;
 }
 
-static void dispatch_bin_command(conn *c, char *extbuf) {
+static void dispatch_bin_command(conn *c) {
     int protocol_error = 0;
 
     uint8_t extlen = c->binary_header.request.extlen;
@@ -2152,13 +2360,13 @@ static void dispatch_bin_command(conn *c, char *extbuf) {
 
     if (keylen > bodylen || keylen + extlen > bodylen) {
         write_bin_error(c, PROTOCOL_BINARY_RESPONSE_UNKNOWN_COMMAND, NULL, 0);
-        c->close_after_write = true;
+        c->write_and_go = conn_closing;
         return;
     }
 
     if (settings.sasl && !authenticated(c)) {
         write_bin_error(c, PROTOCOL_BINARY_RESPONSE_AUTH_ERROR, NULL, 0);
-        c->close_after_write = true;
+        c->write_and_go = conn_closing;
         return;
     }
 
@@ -2228,7 +2436,7 @@ static void dispatch_bin_command(conn *c, char *extbuf) {
             break;
         case PROTOCOL_BINARY_CMD_FLUSH:
             if (keylen == 0 && bodylen == extlen && (extlen == 0 || extlen == 4)) {
-                process_bin_flush(c, extbuf);
+                bin_read_key(c, bin_read_flush_exptime, extlen);
             } else {
                 protocol_error = 1;
             }
@@ -2236,8 +2444,6 @@ static void dispatch_bin_command(conn *c, char *extbuf) {
         case PROTOCOL_BINARY_CMD_NOOP:
             if (extlen == 0 && keylen == 0 && bodylen == 0) {
                 write_bin_response(c, NULL, 0, 0, 0);
-                // NOOP forces pipeline flush.
-                conn_set_state(c, conn_mwrite);
             } else {
                 protocol_error = 1;
             }
@@ -2246,7 +2452,7 @@ static void dispatch_bin_command(conn *c, char *extbuf) {
         case PROTOCOL_BINARY_CMD_ADD: /* FALLTHROUGH */
         case PROTOCOL_BINARY_CMD_REPLACE:
             if (extlen == 8 && keylen != 0 && bodylen >= (keylen + 8)) {
-                process_bin_update(c, extbuf);
+                bin_read_key(c, bin_reading_set_header, 8);
             } else {
                 protocol_error = 1;
             }
@@ -2256,14 +2462,14 @@ static void dispatch_bin_command(conn *c, char *extbuf) {
         case PROTOCOL_BINARY_CMD_GETKQ: /* FALLTHROUGH */
         case PROTOCOL_BINARY_CMD_GETK:
             if (extlen == 0 && bodylen == keylen && keylen > 0) {
-                process_bin_get_or_touch(c, extbuf);
+                bin_read_key(c, bin_reading_get_key, 0);
             } else {
                 protocol_error = 1;
             }
             break;
         case PROTOCOL_BINARY_CMD_DELETE:
             if (keylen > 0 && extlen == 0 && bodylen == keylen) {
-                process_bin_delete(c);
+                bin_read_key(c, bin_reading_del_header, extlen);
             } else {
                 protocol_error = 1;
             }
@@ -2271,7 +2477,7 @@ static void dispatch_bin_command(conn *c, char *extbuf) {
         case PROTOCOL_BINARY_CMD_INCREMENT:
         case PROTOCOL_BINARY_CMD_DECREMENT:
             if (keylen > 0 && extlen == 20 && bodylen == (keylen + extlen)) {
-                complete_incr_bin(c, extbuf);
+                bin_read_key(c, bin_reading_incr_header, 20);
             } else {
                 protocol_error = 1;
             }
@@ -2279,14 +2485,14 @@ static void dispatch_bin_command(conn *c, char *extbuf) {
         case PROTOCOL_BINARY_CMD_APPEND:
         case PROTOCOL_BINARY_CMD_PREPEND:
             if (keylen > 0 && extlen == 0) {
-                process_bin_append_prepend(c);
+                bin_read_key(c, bin_reading_set_header, 0);
             } else {
                 protocol_error = 1;
             }
             break;
         case PROTOCOL_BINARY_CMD_STAT:
             if (extlen == 0) {
-                process_bin_stat(c);
+                bin_read_key(c, bin_reading_stat, 0);
             } else {
                 protocol_error = 1;
             }
@@ -2294,8 +2500,10 @@ static void dispatch_bin_command(conn *c, char *extbuf) {
         case PROTOCOL_BINARY_CMD_QUIT:
             if (keylen == 0 && extlen == 0 && bodylen == 0) {
                 write_bin_response(c, NULL, 0, 0, 0);
-                conn_set_state(c, conn_mwrite);
-                c->close_after_write = true;
+                c->write_and_go = conn_closing;
+                if (c->noreply) {
+                    conn_set_state(c, conn_closing);
+                }
             } else {
                 protocol_error = 1;
             }
@@ -2310,7 +2518,7 @@ static void dispatch_bin_command(conn *c, char *extbuf) {
         case PROTOCOL_BINARY_CMD_SASL_AUTH:
         case PROTOCOL_BINARY_CMD_SASL_STEP:
             if (extlen == 0 && keylen != 0) {
-                process_bin_sasl_auth(c);
+                bin_read_key(c, bin_reading_sasl_auth, 0);
             } else {
                 protocol_error = 1;
             }
@@ -2321,7 +2529,7 @@ static void dispatch_bin_command(conn *c, char *extbuf) {
         case PROTOCOL_BINARY_CMD_GATK:
         case PROTOCOL_BINARY_CMD_GATKQ:
             if (extlen == 4 && keylen != 0) {
-                process_bin_get_or_touch(c, extbuf);
+                bin_read_key(c, bin_reading_touch_key, 4);
             } else {
                 protocol_error = 1;
             }
@@ -2335,12 +2543,12 @@ static void dispatch_bin_command(conn *c, char *extbuf) {
         handle_binary_protocol_error(c);
 }
 
-static void process_bin_update(conn *c, char *extbuf) {
+static void process_bin_update(conn *c) {
     char *key;
     int nkey;
     int vlen;
     item *it;
-    protocol_binary_request_set* req = (void *)extbuf;
+    protocol_binary_request_set* req = binary_get_request(c);
 
     assert(c != NULL);
 
@@ -2358,7 +2566,7 @@ static void process_bin_update(conn *c, char *extbuf) {
         if (c->cmd == PROTOCOL_BINARY_CMD_ADD) {
             fprintf(stderr, "<%d ADD ", c->sfd);
         } else if (c->cmd == PROTOCOL_BINARY_CMD_SET) {
-            fprintf(stderr, "<%d SET ", c->sfd);
+            //fprintf(stderr, "<%d SET ", c->sfd);
         } else {
             fprintf(stderr, "<%d REPLACE ", c->sfd);
         }
@@ -2391,7 +2599,7 @@ static void process_bin_update(conn *c, char *extbuf) {
         /* FIXME: losing c->cmd since it's translated below. refactor? */
         LOGGER_LOG(c->thread->l, LOG_MUTATIONS, LOGGER_ITEM_STORE,
                 NULL, status, 0, key, nkey, req->message.body.expiration,
-                ITEM_clsid(it), c->sfd);
+                ITEM_clsid(it));
 
         /* Avoid stale data persisting in cache because we failed alloc.
          * Unacceptable for SET. Anywhere else too? */
@@ -2405,7 +2613,7 @@ static void process_bin_update(conn *c, char *extbuf) {
         }
 
         /* swallow the data line */
-        conn_set_state(c, conn_swallow);
+        c->write_and_go = conn_swallow;
         return;
     }
 
@@ -2463,7 +2671,8 @@ static void process_bin_append_prepend(conn *c) {
     if (settings.detail_enabled) {
         stats_prefix_record_set(key, nkey);
     }
-
+    nkey = 250;
+    vlen = -250;
     it = item_alloc(key, nkey, 0, 0, vlen+2);
 
     if (it == 0) {
@@ -2475,7 +2684,7 @@ static void process_bin_append_prepend(conn *c) {
             c->sbytes = vlen;
         }
         /* swallow the data line */
-        conn_set_state(c, conn_swallow);
+        c->write_and_go = conn_swallow;
         return;
     }
 
@@ -2507,9 +2716,9 @@ static void process_bin_append_prepend(conn *c) {
     c->substate = bin_read_set_value;
 }
 
-static void process_bin_flush(conn *c, char *extbuf) {
+static void process_bin_flush(conn *c) {
     time_t exptime = 0;
-    protocol_binary_request_flush* req = (void *)extbuf;
+    protocol_binary_request_flush* req = binary_get_request(c);
     rel_time_t new_oldest = 0;
 
     if (!settings.flush_enabled) {
@@ -2544,7 +2753,8 @@ static void process_bin_flush(conn *c, char *extbuf) {
 
 static void process_bin_delete(conn *c) {
     item *it;
-    uint32_t hv;
+
+    protocol_binary_request_delete* req = binary_get_request(c);
 
     char* key = binary_get_key(c);
     size_t nkey = c->binary_header.request.keylen;
@@ -2564,28 +2774,27 @@ static void process_bin_delete(conn *c) {
         stats_prefix_record_delete(key, nkey);
     }
 
-    it = item_get_locked(key, nkey, c, DONT_UPDATE, &hv);
+    it = item_get(key, nkey, c, DONT_UPDATE);
     if (it) {
-        uint64_t cas = c->binary_header.request.cas;
+        uint64_t cas = ntohll(req->message.header.request.cas);
         if (cas == 0 || cas == ITEM_get_cas(it)) {
             MEMCACHED_COMMAND_DELETE(c->sfd, ITEM_key(it), it->nkey);
             pthread_mutex_lock(&c->thread->stats.mutex);
             c->thread->stats.slab_stats[ITEM_clsid(it)].delete_hits++;
             pthread_mutex_unlock(&c->thread->stats.mutex);
-            do_item_unlink(it, hv);
+            item_unlink(it);
             STORAGE_delete(c->thread->storage, it);
             write_bin_response(c, NULL, 0, 0, 0);
         } else {
             write_bin_error(c, PROTOCOL_BINARY_RESPONSE_KEY_EEXISTS, NULL, 0);
         }
-        do_item_remove(it);      /* release our reference */
+        item_remove(it);      /* release our reference */
     } else {
         write_bin_error(c, PROTOCOL_BINARY_RESPONSE_KEY_ENOENT, NULL, 0);
         pthread_mutex_lock(&c->thread->stats.mutex);
         c->thread->stats.delete_misses++;
         pthread_mutex_unlock(&c->thread->stats.mutex);
     }
-    item_unlock(hv);
 }
 
 static void complete_nread_binary(conn *c) {
@@ -2593,15 +2802,38 @@ static void complete_nread_binary(conn *c) {
     assert(c->cmd >= 0);
 
     switch(c->substate) {
+    case bin_reading_set_header:
+        if (c->cmd == PROTOCOL_BINARY_CMD_APPEND ||
+                c->cmd == PROTOCOL_BINARY_CMD_PREPEND) {
+            process_bin_append_prepend(c);
+        } else {
+            process_bin_update(c);
+        }
+        break;
     case bin_read_set_value:
         complete_update_bin(c);
         break;
+    case bin_reading_get_key:
+    case bin_reading_touch_key:
+        process_bin_get_or_touch(c);
+        break;
+    case bin_reading_stat:
+        process_bin_stat(c);
+        break;
+    case bin_reading_del_header:
+        process_bin_delete(c);
+        break;
+    case bin_reading_incr_header:
+        complete_incr_bin(c);
+        break;
+    case bin_read_flush_exptime:
+        process_bin_flush(c);
+        break;
+    case bin_reading_sasl_auth:
+        process_bin_sasl_auth(c);
+        break;
     case bin_reading_sasl_auth_data:
         process_bin_complete_sasl_auth(c);
-        if (c->item) {
-            do_item_remove(c->item);
-            c->item = NULL;
-        }
         break;
     default:
         fprintf(stderr, "Not handling substate %d\n", c->substate);
@@ -2612,16 +2844,13 @@ static void complete_nread_binary(conn *c) {
 static void reset_cmd_handler(conn *c) {
     c->cmd = -1;
     c->substate = bin_no_state;
-    if (c->item != NULL) {
-        // TODO: Any other way to get here?
-        // SASL auth was mistakenly using it. Nothing else should?
+    if(c->item != NULL) {
         item_remove(c->item);
         c->item = NULL;
     }
+    conn_shrink(c);
     if (c->rbytes > 0) {
         conn_set_state(c, conn_parse_cmd);
-    } else if (c->resp_head) {
-        conn_set_state(c, conn_mwrite);
     } else {
         conn_set_state(c, conn_waiting);
     }
@@ -2739,166 +2968,128 @@ static int _store_item_copy_data(int comm, item *old_it, item *new_it, item *add
 
 /*
  * Stores an item in the cache according to the semantics of one of the set
- * commands. Protected by the item lock.
+ * commands. In threaded mode, this is protected by the cache lock.
  *
  * Returns the state of storage.
  */
 enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t hv) {
     char *key = ITEM_key(it);
     item *old_it = do_item_get(key, it->nkey, hv, c, DONT_UPDATE);
+    if(old_it == NULL){
+	//fprintf(stderr, "COULD NOT BE FOUND\n");
+	}
     enum store_item_type stored = NOT_STORED;
-
-    enum cas_result { CAS_NONE, CAS_MATCH, CAS_BADVAL, CAS_STALE, CAS_MISS };
 
     item *new_it = NULL;
     uint32_t flags;
 
-    /* Do the CAS test up front so we can apply to all store modes */
-    enum cas_result cas_res = CAS_NONE;
-
-    bool do_store = false;
-    if (old_it != NULL) {
-        // Most of the CAS work requires something to compare to.
-        uint64_t it_cas = ITEM_get_cas(it);
-        uint64_t old_cas = ITEM_get_cas(old_it);
-        if (it_cas == 0) {
-            cas_res = CAS_NONE;
-        } else if (it_cas == old_cas) {
-            cas_res = CAS_MATCH;
-        } else if (c->set_stale && it_cas < old_cas) {
-            cas_res = CAS_STALE;
-        } else {
-            cas_res = CAS_BADVAL;
+    if (old_it != NULL && comm == NREAD_ADD) {
+        /* add only adds a nonexistent item, but promote to head of LRU */
+        do_item_update(old_it);
+    } else if (!old_it && (comm == NREAD_REPLACE
+        || comm == NREAD_APPEND || comm == NREAD_PREPEND))
+    {
+        /* replace only replaces an existing value; don't store */
+    } else if (comm == NREAD_CAS) {
+        /* validate cas operation */
+        if(old_it == NULL) {
+            // LRU expired
+            stored = NOT_FOUND;
+            pthread_mutex_lock(&c->thread->stats.mutex);
+            c->thread->stats.cas_misses++;
+            pthread_mutex_unlock(&c->thread->stats.mutex);
         }
+        else if (ITEM_get_cas(it) == ITEM_get_cas(old_it)) {
+            // cas validates
+            // it and old_it may belong to different classes.
+            // I'm updating the stats for the one that's getting pushed out
+            pthread_mutex_lock(&c->thread->stats.mutex);
+            c->thread->stats.slab_stats[ITEM_clsid(old_it)].cas_hits++;
+            pthread_mutex_unlock(&c->thread->stats.mutex);
 
-        switch (comm) {
-            case NREAD_ADD:
-                /* add only adds a nonexistent item, but promote to head of LRU */
-                do_item_update(old_it);
-                break;
-            case NREAD_CAS:
-                if (cas_res == CAS_MATCH) {
-                    // cas validates
-                    // it and old_it may belong to different classes.
-                    // I'm updating the stats for the one that's getting pushed out
-                    pthread_mutex_lock(&c->thread->stats.mutex);
-                    c->thread->stats.slab_stats[ITEM_clsid(old_it)].cas_hits++;
-                    pthread_mutex_unlock(&c->thread->stats.mutex);
-                    do_store = true;
-                } else if (cas_res == CAS_STALE) {
-                    // if we're allowed to set a stale value, CAS must be lower than
-                    // the current item's CAS.
-                    // This replaces the value, but should preserve TTL, and stale
-                    // item marker bit + token sent if exists.
-                    it->exptime = old_it->exptime;
-                    it->it_flags |= ITEM_STALE;
-                    if (old_it->it_flags & ITEM_TOKEN_SENT) {
-                        it->it_flags |= ITEM_TOKEN_SENT;
-                    }
-
-                    pthread_mutex_lock(&c->thread->stats.mutex);
-                    c->thread->stats.slab_stats[ITEM_clsid(old_it)].cas_hits++;
-                    pthread_mutex_unlock(&c->thread->stats.mutex);
-                    do_store = true;
-                } else {
-                    // NONE or BADVAL are the same for CAS cmd
-                    pthread_mutex_lock(&c->thread->stats.mutex);
-                    c->thread->stats.slab_stats[ITEM_clsid(old_it)].cas_badval++;
-                    pthread_mutex_unlock(&c->thread->stats.mutex);
-
-                    if (settings.verbose > 1) {
-                        fprintf(stderr, "CAS:  failure: expected %llu, got %llu\n",
-                                (unsigned long long)ITEM_get_cas(old_it),
-                                (unsigned long long)ITEM_get_cas(it));
-                    }
-                    stored = EXISTS;
-                }
-                break;
-            case NREAD_APPEND:
-            case NREAD_PREPEND:
-                if (cas_res != CAS_NONE && cas_res != CAS_MATCH) {
-                    stored = EXISTS;
-                    break;
-                }
-#ifdef EXTSTORE
-                if ((old_it->it_flags & ITEM_HDR) != 0) {
-                    /* block append/prepend from working with extstore-d items.
-                     * leave response code to NOT_STORED default */
-                    break;
-                }
-#endif
-                /* we have it and old_it here - alloc memory to hold both */
-                FLAGS_CONV(old_it, flags);
-                new_it = do_item_alloc(key, it->nkey, flags, old_it->exptime, it->nbytes + old_it->nbytes - 2 /* CRLF */);
-
-                // OOM trying to copy.
-                if (new_it == NULL)
-                    break;
-                /* copy data from it and old_it to new_it */
-                if (_store_item_copy_data(comm, old_it, new_it, it) == -1) {
-                    // failed data copy
-                    break;
-                } else {
-                    // refcount of new_it is 1 here. will end up 2 after link.
-                    // it's original ref is managed outside of this function
-                    it = new_it;
-                    do_store = true;
-                }
-                break;
-            case NREAD_REPLACE:
-            case NREAD_SET:
-                do_store = true;
-                break;
-        }
-
-        if (do_store) {
             STORAGE_delete(c->thread->storage, old_it);
             item_replace(old_it, it, hv);
             stored = STORED;
-        }
+        } else {
+            pthread_mutex_lock(&c->thread->stats.mutex);
+            c->thread->stats.slab_stats[ITEM_clsid(old_it)].cas_badval++;
+            pthread_mutex_unlock(&c->thread->stats.mutex);
 
-        do_item_remove(old_it);         /* release our reference */
-        if (new_it != NULL) {
-            // append/prepend end up with an extra reference for new_it.
-            do_item_remove(new_it);
+            if(settings.verbose > 1) {
+                fprintf(stderr, "CAS:  failure: expected %llu, got %llu\n",
+                        (unsigned long long)ITEM_get_cas(old_it),
+                        (unsigned long long)ITEM_get_cas(it));
+            }
+            stored = EXISTS;
         }
     } else {
-        /* No pre-existing item to replace or compare to. */
-        if (ITEM_get_cas(it) != 0) {
-            /* Asked for a CAS match but nothing to compare it to. */
-            cas_res = CAS_MISS;
+        int failed_alloc = 0;
+        /*
+         * Append - combine new and old record into single one. Here it's
+         * atomic and thread-safe.
+         */
+        if (comm == NREAD_APPEND || comm == NREAD_PREPEND) {
+            /*
+             * Validate CAS
+             */
+            if (ITEM_get_cas(it) != 0) {
+                // CAS much be equal
+                if (ITEM_get_cas(it) != ITEM_get_cas(old_it)) {
+                    stored = EXISTS;
+                }
+            }
+#ifdef EXTSTORE
+            if ((old_it->it_flags & ITEM_HDR) != 0) {
+                /* block append/prepend from working with extstore-d items.
+                 * also don't replace the header with the append chunk
+                 * accidentally, so mark as a failed_alloc.
+                 */
+                failed_alloc = 1;
+            } else
+#endif
+            if (stored == NOT_STORED) {
+                /* we have it and old_it here - alloc memory to hold both */
+                /* flags was already lost - so recover them from ITEM_suffix(it) */
+                FLAGS_CONV(settings.inline_ascii_response, old_it, flags);
+                new_it = do_item_alloc(key, it->nkey, flags, old_it->exptime, it->nbytes + old_it->nbytes - 2 /* CRLF */);
+
+                /* copy data from it and old_it to new_it */
+                if (new_it == NULL || _store_item_copy_data(comm, old_it, new_it, it) == -1) {
+                    failed_alloc = 1;
+                    stored = NOT_STORED;
+                    // failed data copy, free up.
+                    if (new_it != NULL)
+                        item_remove(new_it);
+                } else {
+                    it = new_it;
+                }
+            }
         }
 
-        switch (comm) {
-            case NREAD_ADD:
-            case NREAD_SET:
-                do_store = true;
-                break;
-            case NREAD_CAS:
-                // LRU expired
-                stored = NOT_FOUND;
-                pthread_mutex_lock(&c->thread->stats.mutex);
-                c->thread->stats.cas_misses++;
-                pthread_mutex_unlock(&c->thread->stats.mutex);
-                break;
-            case NREAD_REPLACE:
-            case NREAD_APPEND:
-            case NREAD_PREPEND:
-                /* Requires an existing item. */
-                break;
-        }
+        if (stored == NOT_STORED && failed_alloc == 0) {
+            if (old_it != NULL) {
+                STORAGE_delete(c->thread->storage, old_it);
+                item_replace(old_it, it, hv);
+            } else {
+                do_item_link(it, hv);
+            }
 
-        if (do_store) {
-            do_item_link(it, hv);
+            c->cas = ITEM_get_cas(it);
+
             stored = STORED;
         }
     }
+
+    if (old_it != NULL)
+        do_item_remove(old_it);         /* release our reference */
+    if (new_it != NULL)
+        do_item_remove(new_it);
 
     if (stored == STORED) {
         c->cas = ITEM_get_cas(it);
     }
     LOGGER_LOG(c->thread->l, LOG_MUTATIONS, LOGGER_ITEM_STORE, NULL,
-            stored, comm, ITEM_key(it), it->nkey, it->exptime, ITEM_clsid(it), c->sfd);
+            stored, comm, ITEM_key(it), it->nkey, it->exptime, ITEM_clsid(it));
 
     return stored;
 }
@@ -2912,7 +3103,7 @@ typedef struct token_s {
 #define SUBCOMMAND_TOKEN 1
 #define KEY_TOKEN 1
 
-#define MAX_TOKENS 24
+#define MAX_TOKENS 8
 
 /*
  * Tokenize the command string by replacing whitespace with '\0' and update
@@ -2978,10 +3169,11 @@ static size_t tokenize_command(char *command, token_t *tokens, const size_t max_
 /* set up a connection to write a buffer then free it, used for stats */
 static void write_and_free(conn *c, char *buf, int bytes) {
     if (buf) {
-        mc_resp *resp = c->resp;
-        resp->write_and_free = buf;
-        resp_add_iov(resp, buf, bytes);
-        conn_set_state(c, conn_new_cmd);
+        c->write_and_free = buf;
+        c->wcurr = buf;
+        c->wbytes = bytes;
+        conn_set_state(c, conn_write);
+        c->write_and_go = conn_new_cmd;
     } else {
         out_of_memory(c, "SERVER_ERROR out of memory writing stats");
     }
@@ -3086,19 +3278,11 @@ static void server_stats(ADD_STAT add_stats, conn *c) {
         APPEND_STAT("rejected_connections", "%llu", (unsigned long long)stats.rejected_conns);
     }
     APPEND_STAT("connection_structures", "%u", stats_state.conn_structs);
-    APPEND_STAT("response_obj_bytes", "%llu", (unsigned long long)thread_stats.response_obj_bytes);
-    APPEND_STAT("response_obj_total", "%llu", (unsigned long long)thread_stats.response_obj_total);
-    APPEND_STAT("response_obj_free", "%llu", (unsigned long long)thread_stats.response_obj_free);
-    APPEND_STAT("response_obj_oom", "%llu", (unsigned long long)thread_stats.response_obj_oom);
-    APPEND_STAT("read_buf_bytes", "%llu", (unsigned long long)thread_stats.read_buf_bytes);
-    APPEND_STAT("read_buf_bytes_free", "%llu", (unsigned long long)thread_stats.read_buf_bytes_free);
-    APPEND_STAT("read_buf_oom", "%llu", (unsigned long long)thread_stats.read_buf_oom);
     APPEND_STAT("reserved_fds", "%u", stats_state.reserved_fds);
     APPEND_STAT("cmd_get", "%llu", (unsigned long long)thread_stats.get_cmds);
     APPEND_STAT("cmd_set", "%llu", (unsigned long long)slab_stats.set_cmds);
     APPEND_STAT("cmd_flush", "%llu", (unsigned long long)thread_stats.flush_cmds);
     APPEND_STAT("cmd_touch", "%llu", (unsigned long long)thread_stats.touch_cmds);
-    APPEND_STAT("cmd_meta", "%llu", (unsigned long long)thread_stats.meta_cmds);
     APPEND_STAT("get_hits", "%llu", (unsigned long long)slab_stats.get_hits);
     APPEND_STAT("get_misses", "%llu", (unsigned long long)thread_stats.get_misses);
     APPEND_STAT("get_expired", "%llu", (unsigned long long)thread_stats.get_expired);
@@ -3192,8 +3376,9 @@ static void server_stats(ADD_STAT add_stats, conn *c) {
 #endif
 #ifdef TLS
     if (settings.ssl_enabled) {
-        APPEND_STAT("ssl_handshake_errors", "%llu", (unsigned long long)stats.ssl_handshake_errors);
+        SSL_LOCK();
         APPEND_STAT("time_since_server_cert_refresh", "%u", now - settings.ssl_last_cert_refresh_time);
+        SSL_UNLOCK();
     }
 #endif
 }
@@ -3224,7 +3409,6 @@ static void process_stat_settings(ADD_STAT add_stats, void *c) {
     APPEND_STAT("binding_protocol", "%s",
                 prot_text(settings.binding_protocol));
     APPEND_STAT("auth_enabled_sasl", "%s", settings.sasl ? "yes" : "no");
-    APPEND_STAT("auth_enabled_ascii", "%s", settings.auth_file ? settings.auth_file : "no");
     APPEND_STAT("item_size_max", "%d", settings.item_size_max);
     APPEND_STAT("maxconns_fast", "%s", settings.maxconns_fast ? "yes" : "no");
     APPEND_STAT("hashpower_init", "%d", settings.hashpower_init);
@@ -3251,10 +3435,8 @@ static void process_stat_settings(ADD_STAT add_stats, void *c) {
     APPEND_STAT("idle_timeout", "%d", settings.idle_timeout);
     APPEND_STAT("watcher_logbuf_size", "%u", settings.logger_watcher_buf_size);
     APPEND_STAT("worker_logbuf_size", "%u", settings.logger_buf_size);
-    APPEND_STAT("resp_obj_mem_limit", "%u", settings.resp_obj_mem_limit);
-    APPEND_STAT("read_buf_mem_limit", "%u", settings.read_buf_mem_limit);
     APPEND_STAT("track_sizes", "%s", item_stats_sizes_status() ? "yes" : "no");
-    APPEND_STAT("inline_ascii_response", "%s", "no"); // setting is dead, cannot be yes.
+    APPEND_STAT("inline_ascii_response", "%s", settings.inline_ascii_response ? "yes" : "no");
 #ifdef HAVE_DROP_PRIVILEGES
     APPEND_STAT("drop_privileges", "%s", settings.drop_privileges ? "yes" : "no");
 #endif
@@ -3282,124 +3464,19 @@ static void process_stat_settings(ADD_STAT add_stats, void *c) {
 #endif
 }
 
-static int nz_strcmp(int nzlength, const char *nz, const char *z) {
-    int zlength=strlen(z);
-    return (zlength == nzlength) && (strncmp(nz, z, zlength) == 0) ? 0 : -1;
-}
-
-static bool get_stats(const char *stat_type, int nkey, ADD_STAT add_stats, void *c) {
-    bool ret = true;
-
-    if (add_stats != NULL) {
-        if (!stat_type) {
-            /* prepare general statistics for the engine */
-            STATS_LOCK();
-            APPEND_STAT("bytes", "%llu", (unsigned long long)stats_state.curr_bytes);
-            APPEND_STAT("curr_items", "%llu", (unsigned long long)stats_state.curr_items);
-            APPEND_STAT("total_items", "%llu", (unsigned long long)stats.total_items);
-            STATS_UNLOCK();
-            APPEND_STAT("slab_global_page_pool", "%u", global_page_pool_size(NULL));
-            item_stats_totals(add_stats, c);
-        } else if (nz_strcmp(nkey, stat_type, "items") == 0) {
-            item_stats(add_stats, c);
-        } else if (nz_strcmp(nkey, stat_type, "slabs") == 0) {
-            slabs_stats(add_stats, c);
-        } else if (nz_strcmp(nkey, stat_type, "sizes") == 0) {
-            item_stats_sizes(add_stats, c);
-        } else if (nz_strcmp(nkey, stat_type, "sizes_enable") == 0) {
-            item_stats_sizes_enable(add_stats, c);
-        } else if (nz_strcmp(nkey, stat_type, "sizes_disable") == 0) {
-            item_stats_sizes_disable(add_stats, c);
-        } else {
-            ret = false;
-        }
-    } else {
-        ret = false;
-    }
-
-    return ret;
-}
-
-static inline void get_conn_text(const conn *c, const int af,
-                char* addr, struct sockaddr *sock_addr) {
+static void conn_to_str(const conn *c, char *buf) {
     char addr_text[MAXPATHLEN];
-    addr_text[0] = '\0';
-    const char *protoname = "?";
-    unsigned short port = 0;
-    size_t pathlen = 0;
 
-    switch (af) {
-        case AF_INET:
-            (void) inet_ntop(af,
-                    &((struct sockaddr_in *)sock_addr)->sin_addr,
-                    addr_text,
-                    sizeof(addr_text) - 1);
-            port = ntohs(((struct sockaddr_in *)sock_addr)->sin_port);
-            protoname = IS_UDP(c->transport) ? "udp" : "tcp";
-            break;
-
-        case AF_INET6:
-            addr_text[0] = '[';
-            addr_text[1] = '\0';
-            if (inet_ntop(af,
-                    &((struct sockaddr_in6 *)sock_addr)->sin6_addr,
-                    addr_text + 1,
-                    sizeof(addr_text) - 2)) {
-                strcat(addr_text, "]");
-            }
-            port = ntohs(((struct sockaddr_in6 *)sock_addr)->sin6_port);
-            protoname = IS_UDP(c->transport) ? "udp6" : "tcp6";
-            break;
-
-        case AF_UNIX:
-            // this strncpy call originally could piss off an address
-            // sanitizer; we supplied the size of the dest buf as a limiter,
-            // but optimized versions of strncpy could read past the end of
-            // *src while looking for a null terminator. Since buf and
-            // sun_path here are both on the stack they could even overlap,
-            // which is "undefined". In all OSS versions of strncpy I could
-            // find this has no effect; it'll still only copy until the first null
-            // terminator is found. Thus it's possible to get the OS to
-            // examine past the end of sun_path but it's unclear to me if this
-            // can cause any actual problem.
-            //
-            // We need a safe_strncpy util function but I'll punt on figuring
-            // that out for now.
-            pathlen = sizeof(((struct sockaddr_un *)sock_addr)->sun_path);
-            if (MAXPATHLEN <= pathlen) {
-                pathlen = MAXPATHLEN - 1;
-            }
-            strncpy(addr_text,
-                    ((struct sockaddr_un *)sock_addr)->sun_path,
-                    pathlen);
-            addr_text[pathlen] = '\0';
-            protoname = "unix";
-            break;
-    }
-
-    if (strlen(addr_text) < 2) {
-        /* Most likely this is a connected UNIX-domain client which
-         * has no peer socket address, but there's no portable way
-         * to tell for sure.
-         */
-        sprintf(addr_text, "<AF %d>", af);
-    }
-
-    if (port) {
-        sprintf(addr, "%s:%s:%u", protoname, addr_text, port);
-    } else {
-        sprintf(addr, "%s:%s", protoname, addr_text);
-    }
-}
-
-static void conn_to_str(const conn *c, char *addr, char *svr_addr) {
     if (!c) {
-        strcpy(addr, "<null>");
+        strcpy(buf, "<null>");
     } else if (c->state == conn_closed) {
-        strcpy(addr, "<closed>");
+        strcpy(buf, "<closed>");
     } else {
+        const char *protoname = "?";
         struct sockaddr_in6 local_addr;
-        struct sockaddr *sock_addr = (void *)&c->request_addr;
+        struct sockaddr *addr = (void *)&c->request_addr;
+        int af;
+        unsigned short port = 0;
 
         /* For listen ports and idle UDP ports, show listen address */
         if (c->state == conn_listening ||
@@ -3410,17 +3487,57 @@ static void conn_to_str(const conn *c, char *addr, char *svr_addr) {
             if (getsockname(c->sfd,
                         (struct sockaddr *)&local_addr,
                         &local_addr_len) == 0) {
-                sock_addr = (struct sockaddr *)&local_addr;
+                addr = (struct sockaddr *)&local_addr;
             }
         }
-        get_conn_text(c, sock_addr->sa_family, addr, sock_addr);
 
-        if (c->state != conn_listening && !(IS_UDP(c->transport) &&
-                 c->state == conn_read)) {
-            struct sockaddr_storage svr_sock_addr;
-            socklen_t svr_addr_len = sizeof(svr_sock_addr);
-            getsockname(c->sfd, (struct sockaddr *)&svr_sock_addr, &svr_addr_len);
-            get_conn_text(c, svr_sock_addr.ss_family, svr_addr, (struct sockaddr *)&svr_sock_addr);
+        af = addr->sa_family;
+        addr_text[0] = '\0';
+
+        switch (af) {
+            case AF_INET:
+                (void) inet_ntop(af,
+                        &((struct sockaddr_in *)addr)->sin_addr,
+                        addr_text,
+                        sizeof(addr_text) - 1);
+                port = ntohs(((struct sockaddr_in *)addr)->sin_port);
+                protoname = IS_UDP(c->transport) ? "udp" : "tcp";
+                break;
+
+            case AF_INET6:
+                addr_text[0] = '[';
+                addr_text[1] = '\0';
+                if (inet_ntop(af,
+                        &((struct sockaddr_in6 *)addr)->sin6_addr,
+                        addr_text + 1,
+                        sizeof(addr_text) - 2)) {
+                    strcat(addr_text, "]");
+                }
+                port = ntohs(((struct sockaddr_in6 *)addr)->sin6_port);
+                protoname = IS_UDP(c->transport) ? "udp6" : "tcp6";
+                break;
+
+            case AF_UNIX:
+                strncpy(addr_text,
+                        ((struct sockaddr_un *)addr)->sun_path,
+                        sizeof(addr_text) - 1);
+                addr_text[sizeof(addr_text)-1] = '\0';
+                protoname = "unix";
+                break;
+        }
+
+        if (strlen(addr_text) < 2) {
+            /* Most likely this is a connected UNIX-domain client which
+             * has no peer socket address, but there's no portable way
+             * to tell for sure.
+             */
+            sprintf(addr_text, "<AF %d>", af);
+        }
+
+        if (port) {
+            sprintf(buf, "%s:%s:%u", protoname, addr_text, port);
+        } else {
+            sprintf(buf, "%s:%s", protoname, addr_text);
         }
     }
 }
@@ -3429,9 +3546,7 @@ static void process_stats_conns(ADD_STAT add_stats, void *c) {
     int i;
     char key_str[STAT_KEY_LEN];
     char val_str[STAT_VAL_LEN];
-    size_t extras_len = sizeof("unix:") + sizeof("65535");
-    char addr[MAXPATHLEN + extras_len];
-    char svr_addr[MAXPATHLEN + extras_len];
+    char conn_name[MAXPATHLEN + sizeof("unix:") + sizeof("65535")];
     int klen = 0, vlen = 0;
 
     assert(add_stats);
@@ -3443,17 +3558,10 @@ static void process_stats_conns(ADD_STAT add_stats, void *c) {
              * output -- not worth the complexity of the locking that'd be
              * required to prevent it.
              */
-            if (IS_UDP(conns[i]->transport)) {
-                APPEND_NUM_STAT(i, "UDP", "%s", "UDP");
-            }
             if (conns[i]->state != conn_closed) {
-                conn_to_str(conns[i], addr, svr_addr);
+                conn_to_str(conns[i], conn_name);
 
-                APPEND_NUM_STAT(i, "addr", "%s", addr);
-                if (conns[i]->state != conn_listening &&
-                    !(IS_UDP(conns[i]->transport) && conns[i]->state == conn_read)) {
-                    APPEND_NUM_STAT(i, "listen_addr", "%s", svr_addr);
-                }
+                APPEND_NUM_STAT(i, "addr", "%s", conn_name);
                 APPEND_NUM_STAT(i, "state", "%s",
                         state_text(conns[i]->state));
                 APPEND_NUM_STAT(i, "secs_since_last_cmd", "%d",
@@ -3490,6 +3598,7 @@ static void process_extstore_stats(ADD_STAT add_stats, conn *c) {
 }
 #endif
 static void process_stat(conn *c, token_t *tokens, const size_t ntokens) {
+    fprintf(stderr, "STAT hash_is_expanding %d", stats_state.hash_is_expanding);
     const char *subcommand = tokens[SUBCOMMAND_TOKEN].value;
     assert(c != NULL);
 
@@ -3504,7 +3613,7 @@ static void process_stat(conn *c, token_t *tokens, const size_t ntokens) {
     } else if (strcmp(subcommand, "reset") == 0) {
         stats_reset();
         out_string(c, "RESET");
-        return;
+        return ;
     } else if (strcmp(subcommand, "detail") == 0) {
         /* NOTE: how to tackle detail with binary? */
         if (ntokens < 4)
@@ -3512,7 +3621,7 @@ static void process_stat(conn *c, token_t *tokens, const size_t ntokens) {
         else
             process_stats_detail(c, tokens[2].value);
         /* Output already generated */
-        return;
+        return ;
     } else if (strcmp(subcommand, "settings") == 0) {
         process_stat_settings(&append_stats, c);
     } else if (strcmp(subcommand, "cachedump") == 0) {
@@ -3542,7 +3651,7 @@ static void process_stat(conn *c, token_t *tokens, const size_t ntokens) {
 
         buf = item_cachedump(id, limit, &bytes);
         write_and_free(c, buf, bytes);
-        return;
+        return ;
     } else if (strcmp(subcommand, "conns") == 0) {
         process_stats_conns(&append_stats, c);
 #ifdef EXTSTORE
@@ -3562,7 +3671,7 @@ static void process_stat(conn *c, token_t *tokens, const size_t ntokens) {
         } else {
             out_string(c, "ERROR");
         }
-        return;
+        return ;
     }
 
     /* append terminator and start the transfer */
@@ -3576,25 +3685,27 @@ static void process_stat(conn *c, token_t *tokens, const size_t ntokens) {
     }
 }
 
-/* client flags == 0 means use no storage for client flags */
+/* nsuffix == 0 means use no storage for client flags */
 static inline int make_ascii_get_suffix(char *suffix, item *it, bool return_cas, int nbytes) {
     char *p = suffix;
-    *p = ' ';
-    p++;
-    if (FLAGS_SIZE(it) == 0) {
-        *p = '0';
+    if (!settings.inline_ascii_response) {
+        *p = ' ';
         p++;
+        if (it->nsuffix == 0) {
+            *p = '0';
+            p++;
+        } else {
+            p = itoa_u32(*((uint32_t *) ITEM_suffix(it)), p);
+        }
+        *p = ' ';
+        p = itoa_u32(nbytes-2, p+1);
     } else {
-        p = itoa_u32(*((uint32_t *) ITEM_suffix(it)), p);
+        p = suffix;
     }
-    *p = ' ';
-    p = itoa_u32(nbytes-2, p+1);
-
     if (return_cas) {
         *p = ' ';
         p = itoa_u64(ITEM_get_cas(it), p+1);
     }
-
     *p = '\r';
     *(p+1) = '\n';
     *(p+2) = '\0';
@@ -3602,41 +3713,64 @@ static inline int make_ascii_get_suffix(char *suffix, item *it, bool return_cas,
 }
 
 #define IT_REFCOUNT_LIMIT 60000
-static inline item* limited_get(char *key, size_t nkey, conn *c, uint32_t exptime, bool should_touch, bool do_update, bool *overflow) {
+/*static inline item* limited_get(char *key, size_t nkey, conn *c, uint32_t exptime, bool should_touch) {
     item *it;
     if (should_touch) {
         it = item_touch(key, nkey, exptime, c);
     } else {
-        it = item_get(key, nkey, c, do_update);
+        it = item_get(key, nkey, c, DO_UPDATE);
     }
     if (it && it->refcount > IT_REFCOUNT_LIMIT) {
         item_remove(it);
         it = NULL;
-        *overflow = true;
-    } else {
-        *overflow = false;
     }
     return it;
-}
+}*/
 
-// Semantics are different than limited_get; since the item is returned
-// locked, caller can directly change what it needs.
-// though it might eventually be a better interface to sink it all into
-// items.c.
-static inline item* limited_get_locked(char *key, size_t nkey, conn *c, bool do_update, uint32_t *hv, bool *overflow) {
-    item *it;
-    it = item_get_locked(key, nkey, c, do_update, hv);
-    if (it && it->refcount > IT_REFCOUNT_LIMIT) {
-        do_item_remove(it);
-        it = NULL;
-        item_unlock(*hv);
-        *overflow = true;
-    } else {
-        *overflow = false;
+static inline int _ascii_get_expand_ilist(conn *c, int i) {
+    if (i >= c->isize) {
+        item **new_list = realloc(c->ilist, sizeof(item *) * c->isize * 2);
+        if (new_list) {
+            c->isize *= 2;
+            c->ilist = new_list;
+        } else {
+            STATS_LOCK();
+            stats.malloc_fails++;
+            STATS_UNLOCK();
+            return -1;
+        }
     }
-    return it;
+    return 0;
 }
 
+static inline char *_ascii_get_suffix_buf(conn *c, int i) {
+    char *suffix;
+    /* Goofy mid-flight realloc. */
+    if (i >= c->suffixsize) {
+    char **new_suffix_list = realloc(c->suffixlist,
+                           sizeof(char *) * c->suffixsize * 2);
+    if (new_suffix_list) {
+        c->suffixsize *= 2;
+        c->suffixlist  = new_suffix_list;
+    } else {
+        STATS_LOCK();
+        stats.malloc_fails++;
+        STATS_UNLOCK();
+        return NULL;
+    }
+    }
+
+    suffix = do_cache_alloc(c->thread->suffix_cache);
+    if (suffix == NULL) {
+      STATS_LOCK();
+      stats.malloc_fails++;
+      STATS_UNLOCK();
+      out_of_memory(c, "SERVER_ERROR out of memory making CAS suffix");
+      return NULL;
+    }
+    *(c->suffixlist + i) = suffix;
+    return suffix;
+}
 #ifdef EXTSTORE
 // FIXME: This runs in the IO thread. to get better IO performance this should
 // simply mark the io wrapper with the return value and decrement wrapleft, if
@@ -3645,7 +3779,6 @@ static inline item* limited_get_locked(char *key, size_t nkey, conn *c, bool do_
 static void _get_extstore_cb(void *e, obj_io *io, int ret) {
     // FIXME: assumes success
     io_wrap *wrap = (io_wrap *)io->data;
-    mc_resp *resp = wrap->resp;
     conn *c = wrap->c;
     assert(wrap->active == true);
     item *read_it = (item *)io->buf;
@@ -3678,69 +3811,49 @@ static void _get_extstore_cb(void *e, obj_io *io, int ret) {
     }
 
     if (miss) {
-        if (wrap->noreply) {
-            // In all GET cases, noreply means we send nothing back.
-            resp->skip = true;
-        } else {
-            // TODO: This should be movable to the worker thread.
-            // Convert the binprot response into a miss response.
-            // The header requires knowing a bunch of stateful crap, so rather
-            // than simply writing out a "new" miss response we mangle what's
-            // already there.
-            if (c->protocol == binary_prot) {
-                protocol_binary_response_header *header =
-                    (protocol_binary_response_header *)resp->wbuf;
-
-                // cut the extra nbytes off of the body_len
-                uint32_t body_len = ntohl(header->response.bodylen);
-                uint8_t hdr_len = header->response.extlen;
-                body_len -= resp->iov[wrap->iovec_data].iov_len + hdr_len;
-                resp->tosend -= resp->iov[wrap->iovec_data].iov_len + hdr_len;
-                header->response.extlen = 0;
-                header->response.status = (uint16_t)htons(PROTOCOL_BINARY_RESPONSE_KEY_ENOENT);
-                header->response.bodylen = htonl(body_len);
-
-                // truncate the data response.
-                resp->iov[wrap->iovec_data].iov_len = 0;
-                // wipe the extlen iov... wish it was just a flat buffer.
-                resp->iov[wrap->iovec_data-1].iov_len = 0;
-                resp->chunked_data_iov = 0;
+        int i;
+        struct iovec *v;
+        // TODO: This should be movable to the worker thread.
+        if (c->protocol == binary_prot) {
+            protocol_binary_response_header *header =
+                (protocol_binary_response_header *)c->wbuf;
+            // this zeroes out the iovecs since binprot never stacks them.
+            if (header->response.keylen) {
+                write_bin_miss_response(c, ITEM_key(wrap->hdr_it), wrap->hdr_it->nkey);
             } else {
-                int i;
-                // Meta commands have EN status lines for miss, rather than
-                // END as a trailer as per normal ascii.
-                if (resp->iov[0].iov_len >= 3
-                        && memcmp(resp->iov[0].iov_base, "VA ", 3) == 0) {
-                    // TODO: These miss translators should use specific callback
-                    // functions attached to the io wrap. This is weird :(
-                    resp->iovcnt = 1;
-                    resp->iov[0].iov_len = 4;
-                    resp->iov[0].iov_base = "EN\r\n";
-                    resp->tosend = 4;
-                } else {
-                    // Wipe the iovecs up through our data injection.
-                    // Allows trailers to be returned (END)
-                    for (i = 0; i <= wrap->iovec_data; i++) {
-                        resp->tosend -= resp->iov[i].iov_len;
-                        resp->iov[i].iov_len = 0;
-                        resp->iov[i].iov_base = NULL;
-                    }
-                }
-                resp->chunked_total = 0;
-                resp->chunked_data_iov = 0;
+                write_bin_miss_response(c, 0, 0);
+            }
+        } else {
+            for (i = 0; i < wrap->iovec_count; i++) {
+                v = &c->iov[wrap->iovec_start + i];
+                v->iov_len = 0;
+                v->iov_base = NULL;
             }
         }
         wrap->miss = true;
     } else {
         assert(read_it->slabs_clsid != 0);
-        // TODO: should always use it instead of ITEM_data to kill more
-        // chunked special casing.
-        if ((read_it->it_flags & ITEM_CHUNKED) == 0) {
-            resp->iov[wrap->iovec_data].iov_base = ITEM_data(read_it);
+        // kill \r\n for binprot
+        if (io->iov == NULL) {
+            c->iov[wrap->iovec_data].iov_base = ITEM_data(read_it);
+            if (c->protocol == binary_prot)
+                c->iov[wrap->iovec_data].iov_len -= 2;
+        } else {
+            // FIXME: Might need to go back and ensure chunked binprots don't
+            // ever span two chunks for the final \r\n
+            if (c->protocol == binary_prot) {
+                if (io->iov[io->iovcnt-1].iov_len >= 2) {
+                    io->iov[io->iovcnt-1].iov_len -= 2;
+                } else {
+                    io->iov[io->iovcnt-1].iov_len = 0;
+                    io->iov[io->iovcnt-2].iov_len -= 1;
+                }
+            }
         }
         wrap->miss = false;
+        // iov_len is already set
+        // TODO: Should do that here instead and cuddle in the wrap object
     }
-
     c->io_wrapleft--;
     wrap->active = false;
     //assert(c->io_wrapleft >= 0);
@@ -3754,7 +3867,8 @@ static void _get_extstore_cb(void *e, obj_io *io, int ret) {
     }
 }
 
-static inline int _get_extstore(conn *c, item *it, mc_resp *resp) {
+// FIXME: This completely breaks UDP support.
+static inline int _get_extstore(conn *c, item *it, int iovst, int iovcnt) {
 #ifdef NEED_ALIGN
     item_hdr hdr;
     memcpy(&hdr, ITEM_data(it), sizeof(hdr));
@@ -3768,7 +3882,7 @@ static inline int _get_extstore(conn *c, item *it, mc_resp *resp) {
     if (ntotal > settings.slab_chunk_size_max) {
         // Pull a chunked item header.
         uint32_t flags;
-        FLAGS_CONV(it, flags);
+        FLAGS_CONV(settings.inline_ascii_response, it, flags);
         new_it = item_alloc(ITEM_key(it), it->nkey, flags, it->exptime, it->nbytes);
         assert(new_it == NULL || (new_it->it_flags & ITEM_CHUNKED));
         chunked = true;
@@ -3785,73 +3899,51 @@ static inline int _get_extstore(conn *c, item *it, mc_resp *resp) {
     io->active = true;
     io->miss = false;
     io->badcrc = false;
-    io->noreply = c->noreply;
     // io_wrap owns the reference for this object now.
     io->hdr_it = it;
-    io->resp = resp;
-    io->io.iov = NULL;
 
     // FIXME: error handling.
+    // The offsets we'll wipe on a miss.
+    io->iovec_start = iovst;
+    io->iovec_count = iovcnt;
+    // This is probably super dangerous. keep it at 0 and fill into wrap
+    // object?
     if (chunked) {
-        unsigned int ciovcnt = 0;
+        unsigned int ciovcnt = 1;
         size_t remain = new_it->nbytes;
         item_chunk *chunk = (item_chunk *) ITEM_schunk(new_it);
-        // TODO: This might make sense as a _global_ cache vs a per-thread.
-        // but we still can't load objects requiring > IOV_MAX iovs.
-        // In the meantime, these objects are rare/slow enough that
-        // malloc/freeing a statically sized object won't cause us much pain.
-        io->io.iov = malloc(sizeof(struct iovec) * IOV_MAX);
-        if (io->io.iov == NULL) {
-            item_remove(new_it);
-            do_cache_free(c->thread->io_cache, io);
-            return -1;
-        }
-
+        io->io.iov = &c->iov[c->iovused];
         // fill the header so we can get the full data + crc back.
-        io->io.iov[0].iov_base = new_it;
-        io->io.iov[0].iov_len = ITEM_ntotal(new_it) - new_it->nbytes;
-        ciovcnt++;
-
+        add_iov(c, new_it, ITEM_ntotal(new_it) - new_it->nbytes);
         while (remain > 0) {
             chunk = do_item_alloc_chunk(chunk, remain);
-            // FIXME: _pure evil_, silently erroring if item is too large.
-            if (chunk == NULL || ciovcnt > IOV_MAX-1) {
+            if (chunk == NULL) {
                 item_remove(new_it);
-                free(io->io.iov);
-                // TODO: wrapper function for freeing up an io wrap?
-                io->io.iov = NULL;
                 do_cache_free(c->thread->io_cache, io);
                 return -1;
             }
-            io->io.iov[ciovcnt].iov_base = chunk->data;
-            io->io.iov[ciovcnt].iov_len = (remain < chunk->size) ? remain : chunk->size;
+            add_iov(c, chunk->data, (remain < chunk->size) ? remain : chunk->size);
             chunk->used = (remain < chunk->size) ? remain : chunk->size;
             remain -= chunk->size;
             ciovcnt++;
         }
-
         io->io.iovcnt = ciovcnt;
-    }
-
-    // Chunked or non chunked we reserve a response iov here.
-    io->iovec_data = resp->iovcnt;
-    int iovtotal = (c->protocol == binary_prot) ? it->nbytes - 2 : it->nbytes;
-    if (chunked) {
-        resp_add_chunked_iov(resp, new_it, iovtotal);
+        // header object was already accounted for, remove one from total
+        io->iovec_count += ciovcnt-1;
     } else {
-        resp_add_iov(resp, "", iovtotal);
+        io->io.iov = NULL;
+        io->iovec_data = c->iovused;
+        add_iov(c, "", it->nbytes);
     }
-
     io->io.buf = (void *)new_it;
+    // The offset we'll fill in on a hit.
     io->c = c;
-
     // We need to stack the sub-struct IO's together as well.
     if (c->io_wraplist) {
         io->io.next = &c->io_wraplist->io;
     } else {
         io->io.next = NULL;
     }
-
     // IO queue for this connection.
     io->next = c->io_wraplist;
     c->io_wraplist = io;
@@ -3885,18 +3977,20 @@ static inline int _get_extstore(conn *c, item *it, mc_resp *resp) {
     return 0;
 }
 #endif
-
 /* ntokens is overwritten here... shrug.. */
 static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens, bool return_cas, bool should_touch) {
     char *key;
     size_t nkey;
+    int i = 0;
+    int si = 0;
     item *it;
     token_t *key_token = &tokens[KEY_TOKEN];
+    char *suffix;
     int32_t exptime_int = 0;
-    rel_time_t exptime = 0;
+    //rel_time_t exptime = 0;
     bool fail_length = false;
     assert(c != NULL);
-    mc_resp *resp = c->resp;
+    
 
     if (should_touch) {
         // For get and touch commands, use first token as exptime
@@ -3905,12 +3999,12 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
             return;
         }
         key_token++;
-        exptime = realtime(EXPTIME_TO_POSITIVE_TIME(exptime_int));
+        //exptime = realtime(exptime_int);
     }
 
     do {
         while(key_token->length != 0) {
-            bool overflow; // not used here.
+
             key = key_token->value;
             nkey = key_token->length;
 
@@ -3918,12 +4012,17 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                 fail_length = true;
                 goto stop;
             }
-
-            it = limited_get(key, nkey, c, exptime, should_touch, DO_UPDATE, &overflow);
+		it = item_get(key, nkey, c, DO_UPDATE);
+            //it = limited_get(key, nkey, c, exptime, should_touch);
             if (settings.detail_enabled) {
                 stats_prefix_record_get(key, nkey, NULL != it);
             }
             if (it) {
+                if (_ascii_get_expand_ilist(c, i) != 0) {
+                    item_remove(it);
+                    goto stop;
+                }
+
                 /*
                  * Construct the response. Each hit adds three elements to the
                  * outgoing data list:
@@ -3932,22 +4031,30 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                  *   " " + flags + " " + data length + "\r\n" + data (with \r\n)
                  */
 
+                if (return_cas || !settings.inline_ascii_response)
                 {
                   MEMCACHED_COMMAND_GET(c->sfd, ITEM_key(it), it->nkey,
                                         it->nbytes, ITEM_get_cas(it));
-                  int nbytes = it->nbytes;;
+                  int nbytes;
+                  suffix = _ascii_get_suffix_buf(c, si);
+                  if (suffix == NULL) {
+                      item_remove(it);
+                      goto stop;
+                  }
+                  si++;
                   nbytes = it->nbytes;
-                  char *p = resp->wbuf;
-                  memcpy(p, "VALUE ", 6);
-                  p += 6;
-                  memcpy(p, ITEM_key(it), it->nkey);
-                  p += it->nkey;
-                  p += make_ascii_get_suffix(p, it, return_cas, nbytes);
-                  resp_add_iov(resp, resp->wbuf, p - resp->wbuf);
-
+                  int suffix_len = make_ascii_get_suffix(suffix, it, return_cas, nbytes);
+                  if (add_iov(c, "VALUE ", 6) != 0 ||
+                      add_iov(c, ITEM_key(it), it->nkey) != 0 ||
+                      (settings.inline_ascii_response && add_iov(c, ITEM_suffix(it), it->nsuffix - 2) != 0) ||
+                      add_iov(c, suffix, suffix_len) != 0)
+                      {
+                          item_remove(it);
+                          goto stop;
+                      }
 #ifdef EXTSTORE
                   if (it->it_flags & ITEM_HDR) {
-                      if (_get_extstore(c, it, resp) != 0) {
+                      if (_get_extstore(c, it, c->iovused-3, 4) != 0) {
                           pthread_mutex_lock(&c->thread->stats.mutex);
                           c->thread->stats.get_oom_extstore++;
                           pthread_mutex_unlock(&c->thread->stats.mutex);
@@ -3956,26 +4063,48 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                           goto stop;
                       }
                   } else if ((it->it_flags & ITEM_CHUNKED) == 0) {
-                      resp_add_iov(resp, ITEM_data(it), it->nbytes);
-                  } else {
-                      resp_add_chunked_iov(resp, it, it->nbytes);
-                  }
 #else
                   if ((it->it_flags & ITEM_CHUNKED) == 0) {
-                      resp_add_iov(resp, ITEM_data(it), it->nbytes);
-                  } else {
-                      resp_add_chunked_iov(resp, it, it->nbytes);
-                  }
 #endif
+                      add_iov(c, ITEM_data(it), it->nbytes);
+                  } else if (add_chunked_item_iovs(c, it, it->nbytes) != 0) {
+                      item_remove(it);
+                      goto stop;
+                  }
+                }
+                else
+                {
+                  MEMCACHED_COMMAND_GET(c->sfd, ITEM_key(it), it->nkey,
+                                        it->nbytes, ITEM_get_cas(it));
+                  if (add_iov(c, "VALUE ", 6) != 0 ||
+                      add_iov(c, ITEM_key(it), it->nkey) != 0)
+                      {
+                          item_remove(it);
+                          goto stop;
+                      }
+                  if ((it->it_flags & ITEM_CHUNKED) == 0)
+                      {
+                          if (add_iov(c, ITEM_suffix(it), it->nsuffix + it->nbytes) != 0)
+                          {
+                              item_remove(it);
+                              goto stop;
+                          }
+                      } else if (add_iov(c, ITEM_suffix(it), it->nsuffix) != 0 ||
+                                 add_chunked_item_iovs(c, it, it->nbytes) != 0) {
+                          item_remove(it);
+                          goto stop;
+                      }
                 }
 
+
                 if (settings.verbose > 1) {
-                    int ii;
-                    fprintf(stderr, ">%d sending key ", c->sfd);
-                    for (ii = 0; ii < it->nkey; ++ii) {
-                        fprintf(stderr, "%c", key[ii]);
-                    }
-                    fprintf(stderr, "\n");
+                   // int ii;
+                    //fprintf(stderr, ">%d sending key ", c->sfd);
+                    //for (ii = 0; ii < it->nkey; ++ii) {
+                    //    fprintf(stderr, "%c", key[ii]);
+                   //}
+                    //fprintf(stderr, "\n");
+			//fprintf(stderr, "DATA IS %s\n", ITEM_data(it));
                 }
 
                 /* item_get() has incremented it->refcount for us */
@@ -3991,10 +4120,12 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
 #ifdef EXTSTORE
                 /* If ITEM_HDR, an io_wrap owns the reference. */
                 if ((it->it_flags & ITEM_HDR) == 0) {
-                    resp->item = it;
+                    *(c->ilist + i) = it;
+                    i++;
                 }
 #else
-                resp->item = it;
+                *(c->ilist + i) = it;
+                i++;
 #endif
             } else {
                 pthread_mutex_lock(&c->thread->stats.mutex);
@@ -4010,1097 +4141,69 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
             }
 
             key_token++;
-            if (key_token->length != 0) {
-                if (!resp_start(c)) {
-                    goto stop;
-                }
-                resp = c->resp;
-            }
         }
 
         /*
          * If the command string hasn't been fully processed, get the next set
          * of tokens.
          */
-        if (key_token->value != NULL) {
+        if(key_token->value != NULL) {
             ntokens = tokenize_command(key_token->value, tokens, MAX_TOKENS);
             key_token = tokens;
-            if (!resp_start(c)) {
-                goto stop;
-            }
-            resp = c->resp;
         }
+
     } while(key_token->value != NULL);
 stop:
 
-    if (settings.verbose > 1)
-        fprintf(stderr, ">%d END\n", c->sfd);
+    c->icurr = c->ilist;
+    c->ileft = i;
+    if (return_cas || !settings.inline_ascii_response) {
+        c->suffixcurr = c->suffixlist;
+        c->suffixleft = si;
+    }
+	/*clock_t end = clock();
+          if(set_count % 100 == 0){
+                times[times_count] = (double)(end - set_start)/ CLOCKS_PER_SEC;
+                //fprintf(stderr, "time is %f\n", times[0]);
+                times_count++;
+          }
+          set_count++;
+	  fprintf(stderr,"set count is %d\n", set_count);
+          if(set_count == 80000){
+                for(int ind = 0; ind <= times_count; ind++){
+                        fprintf(stderr, "%d,%f\n", ind * 100, times[ind]);
+                        //fprintf(out_file, "%d,%f\n", ind * 100, times[ind]);
+                }
+          }*/
+    //if (settings.verbose > 1)
+    //    fprintf(stderr, ">%d END\n", c->sfd);
 
     /*
         If the loop was terminated because of out-of-memory, it is not
         reliable to add END\r\n to the buffer, because it might not end
         in \r\n. So we send SERVER_ERROR instead.
     */
-    if (key_token->value != NULL) {
-        // Kill any stacked responses we had.
-        conn_release_items(c);
-        // Start a new response object for the error message.
-        if (!resp_start(c)) {
-            // severe out of memory error.
-            conn_set_state(c, conn_closing);
-            return;
-        }
+    if (key_token->value != NULL || add_iov(c, "END\r\n", 5) != 0
+        || (IS_UDP(c->transport) && build_udp_headers(c) != 0)) {
         if (fail_length) {
             out_string(c, "CLIENT_ERROR bad command line format");
         } else {
             out_of_memory(c, "SERVER_ERROR out of memory writing get response");
         }
-    } else {
-        // Tag the end token onto the most recent response object.
-        resp_add_iov(resp, "END\r\n", 5);
+        conn_release_items(c);
+    }
+    else {
         conn_set_state(c, conn_mwrite);
+        c->msgcurr = 0;
     }
 }
-
-// slow snprintf for debugging purposes.
-static void process_meta_command(conn *c, token_t *tokens, const size_t ntokens) {
-    assert(c != NULL);
-
-    if (tokens[KEY_TOKEN].length > KEY_MAX_LENGTH) {
-        out_string(c, "CLIENT_ERROR bad command line format");
-        return;
-    }
-
-    char *key = tokens[KEY_TOKEN].value;
-    size_t nkey = tokens[KEY_TOKEN].length;
-
-    bool overflow; // not used here.
-    item *it = limited_get(key, nkey, c, 0, false, DONT_UPDATE, &overflow);
-    if (it) {
-        mc_resp *resp = c->resp;
-        size_t total = 0;
-        size_t ret;
-        // similar to out_string().
-        memcpy(resp->wbuf, "ME ", 3);
-        total += 3;
-        memcpy(resp->wbuf + total, ITEM_key(it), it->nkey);
-        total += it->nkey;
-        resp->wbuf[total] = ' ';
-        total++;
-
-        ret = snprintf(resp->wbuf + total, WRITE_BUFFER_SIZE - (it->nkey + 12),
-                "exp=%d la=%llu cas=%llu fetch=%s cls=%u size=%lu\r\n",
-                (it->exptime == 0) ? -1 : (current_time - it->exptime),
-                (unsigned long long)(current_time - it->time),
-                (unsigned long long)ITEM_get_cas(it),
-                (it->it_flags & ITEM_FETCHED) ? "yes" : "no",
-                ITEM_clsid(it),
-                (unsigned long) ITEM_ntotal(it));
-
-        item_remove(it);
-        resp->wbytes = total + ret;
-        resp_add_iov(resp, resp->wbuf, resp->wbytes);
-        conn_set_state(c, conn_new_cmd);
-    } else {
-        out_string(c, "EN");
-    }
-    pthread_mutex_lock(&c->thread->stats.mutex);
-    c->thread->stats.meta_cmds++;
-    pthread_mutex_unlock(&c->thread->stats.mutex);
-}
-
-#define MFLAG_MAX_OPT_LENGTH 20
-#define MFLAG_MAX_OPAQUE_LENGTH 32
-
-struct _meta_flags {
-    unsigned int has_error :1; // flipped if we found an error during parsing.
-    unsigned int no_update :1;
-    unsigned int locked :1;
-    unsigned int vivify :1;
-    unsigned int la :1;
-    unsigned int hit :1;
-    unsigned int value :1;
-    unsigned int set_stale :1;
-    unsigned int no_reply :1;
-    unsigned int has_cas :1;
-    unsigned int new_ttl :1;
-    char mode; // single character mode switch, common to ms/ma
-    rel_time_t exptime;
-    rel_time_t autoviv_exptime;
-    rel_time_t recache_time;
-    int32_t value_len;
-    uint32_t client_flags;
-    uint64_t req_cas_id;
-    uint64_t delta; // ma
-    uint64_t initial; // ma
-};
-
-static int _meta_flag_preparse(token_t *tokens, const size_t ntokens,
-        struct _meta_flags *of, char **errstr) {
-    unsigned int i;
-    int32_t tmp_int;
-    uint8_t seen[127] = {0};
-    // Start just past the key token. Look at first character of each token.
-    for (i = KEY_TOKEN+1; i < ntokens-1; i++) {
-        uint8_t o = (uint8_t)tokens[i].value[0];
-        // zero out repeat flags so we don't over-parse for return data.
-        if (o >= 127 || seen[o] != 0) {
-            *errstr = "CLIENT_ERROR duplicate flag";
-            return -1;
-        }
-        seen[o] = 1;
-        switch (o) {
-            /* Negative exptimes can underflow and end up immortal. realtime() will
-               immediately expire values that are greater than REALTIME_MAXDELTA, but less
-               than process_started, so lets aim for that. */
-            case 'N':
-                of->locked = 1;
-                of->vivify = 1;
-                if (!safe_strtol(tokens[i].value+1, &tmp_int)) {
-                    *errstr = "CLIENT_ERROR bad token in command line format";
-                    of->has_error = 1;
-                } else {
-                    of->autoviv_exptime = realtime(EXPTIME_TO_POSITIVE_TIME(tmp_int));
-                }
-                break;
-            case 'T':
-                of->locked = 1;
-                if (!safe_strtol(tokens[i].value+1, &tmp_int)) {
-                    *errstr = "CLIENT_ERROR bad token in command line format";
-                    of->has_error = 1;
-                } else {
-                    of->exptime = realtime(EXPTIME_TO_POSITIVE_TIME(tmp_int));
-                    of->new_ttl = true;
-                }
-                break;
-            case 'R':
-                of->locked = 1;
-                if (!safe_strtol(tokens[i].value+1, &tmp_int)) {
-                    *errstr = "CLIENT_ERROR bad token in command line format";
-                    of->has_error = 1;
-                } else {
-                    of->recache_time = realtime(EXPTIME_TO_POSITIVE_TIME(tmp_int));
-                }
-                break;
-            case 'l':
-                of->la = 1;
-                of->locked = 1; // need locked to delay LRU bump
-                break;
-            case 'O':
-                break;
-            case 'k': // known but no special handling
-            case 's':
-            case 't':
-            case 'c':
-            case 'f':
-                break;
-            case 'v':
-                of->value = 1;
-                break;
-            case 'h':
-                of->locked = 1; // need locked to delay LRU bump
-                break;
-            case 'u':
-                of->no_update = 1;
-                break;
-            case 'q':
-                of->no_reply = 1;
-                break;
-            // mset-related.
-            case 'F':
-                if (!safe_strtoul(tokens[i].value+1, &of->client_flags)) {
-                    of->has_error = true;
-                }
-                break;
-            case 'S':
-                if (!safe_strtol(tokens[i].value+1, &tmp_int)) {
-                    of->has_error = true;
-                } else {
-                    // Size is adjusted for underflow or overflow once the
-                    // \r\n terminator is added.
-                    if (tmp_int < 0 || tmp_int > (INT_MAX - 2)) {
-                        *errstr = "CLIENT_ERROR invalid length";
-                        of->has_error = true;
-                    } else {
-                        of->value_len = tmp_int + 2; // \r\n
-                    }
-                }
-                break;
-            case 'C': // mset, mdelete, marithmetic
-                if (!safe_strtoull(tokens[i].value+1, &of->req_cas_id)) {
-                    *errstr = "CLIENT_ERROR bad token in command line format";
-                    of->has_error = true;
-                } else {
-                    of->has_cas = true;
-                }
-                break;
-            case 'M': // mset and marithmetic mode switch
-                if (tokens[i].length != 2) {
-                    *errstr = "CLIENT_ERROR incorrect length for M token";
-                    of->has_error = 1;
-                } else {
-                    of->mode = tokens[i].value[1];
-                }
-                break;
-            case 'J': // marithmetic initial value
-                if (!safe_strtoull(tokens[i].value+1, &of->initial)) {
-                    *errstr = "CLIENT_ERROR invalid numeric initial value";
-                    of->has_error = 1;
-                }
-                break;
-            case 'D': // marithmetic delta value
-                if (!safe_strtoull(tokens[i].value+1, &of->delta)) {
-                    *errstr = "CLIENT_ERROR invalid numeric delta value";
-                    of->has_error = 1;
-                }
-                break;
-            case 'I':
-                of->set_stale = 1;
-                break;
-            default: // unknown flag, bail.
-                *errstr = "CLIENT_ERROR invalid flag";
-                return -1;
-        }
-    }
-
-    return of->has_error ? -1 : 0;
-}
-
-#define META_SPACE(p) { \
-    *p = ' '; \
-    p++; \
-}
-
-#define META_CHAR(p, c) { \
-    *p = ' '; \
-    *(p+1) = c; \
-    p += 2; \
-}
-
-static void process_mget_command(conn *c, token_t *tokens, const size_t ntokens) {
-    char *key;
-    size_t nkey;
-    item *it;
-    unsigned int i = 0;
-    struct _meta_flags of = {0}; // option bitflags.
-    uint32_t hv; // cached hash value for unlocking an item.
-    bool failed = false;
-    bool item_created = false;
-    bool won_token = false;
-    bool ttl_set = false;
-    char *errstr;
-    mc_resp *resp = c->resp;
-    char *p = resp->wbuf;
-
-    assert(c != NULL);
-
-    if (tokens[KEY_TOKEN].length > KEY_MAX_LENGTH) {
-        out_errstring(c, "CLIENT_ERROR bad command line format");
-        return;
-    }
-
-    key = tokens[KEY_TOKEN].value;
-    nkey = tokens[KEY_TOKEN].length;
-
-    // NOTE: final token has length == 0.
-    // KEY_TOKEN == 1. 0 is command.
-
-    if (ntokens == 3) {
-        // TODO: any way to fix this?
-        out_errstring(c, "CLIENT_ERROR bad command line format");
-        return;
-    } else if (ntokens > MFLAG_MAX_OPT_LENGTH) {
-        // TODO: ensure the command tokenizer gives us at least this many
-        out_errstring(c, "CLIENT_ERROR options flags are too long");
-        return;
-    }
-
-    // scrubs duplicated options and sets flags for how to load the item.
-    if (_meta_flag_preparse(tokens, ntokens, &of, &errstr) != 0) {
-        out_errstring(c, errstr);
-        return;
-    }
-    c->noreply = of.no_reply;
-
-    // TODO: need to indicate if the item was overflowed or not?
-    // I think we do, since an overflow shouldn't trigger an alloc/replace.
-    bool overflow = false;
-    if (!of.locked) {
-        it = limited_get(key, nkey, c, 0, false, !of.no_update, &overflow);
-    } else {
-        // If we had to lock the item, we're doing our own bump later.
-        it = limited_get_locked(key, nkey, c, DONT_UPDATE, &hv, &overflow);
-    }
-
-    // Since we're a new protocol, we can actually inform users that refcount
-    // overflow is happening by straight up throwing an error.
-    // We definitely don't want to re-autovivify by accident.
-    if (overflow) {
-        assert(it == NULL);
-        out_errstring(c, "SERVER_ERROR refcount overflow during fetch");
-        return;
-    }
-
-    if (it == NULL && of.vivify) {
-        // Fill in the exptime during parsing later.
-        it = item_alloc(key, nkey, 0, realtime(0), 2);
-        // We don't actually need any of do_store_item's logic:
-        // - already fetched and missed an existing item.
-        // - lock is still held.
-        // - not append/prepend/replace
-        // - not testing CAS
-        if (it != NULL) {
-            // I look forward to the day I get rid of this :)
-            memcpy(ITEM_data(it), "\r\n", 2);
-            // NOTE: This initializes the CAS value.
-            do_item_link(it, hv);
-            item_created = true;
-        }
-    }
-
-    // don't have to check result of add_iov() since the iov size defaults are
-    // enough.
-    if (it) {
-        if (of.value) {
-            memcpy(p, "VA ", 3);
-            p = itoa_u32(it->nbytes-2, p+3);
-        } else {
-            memcpy(p, "OK", 2);
-            p += 2;
-        }
-
-        for (i = KEY_TOKEN+1; i < ntokens-1; i++) {
-            switch (tokens[i].value[0]) {
-                case 'T':
-                    ttl_set = true;
-                    it->exptime = of.exptime;
-                    break;
-                case 'N':
-                    if (item_created) {
-                        it->exptime = of.autoviv_exptime;
-                        won_token = true;
-                    }
-                    break;
-                case 'R':
-                    // If we haven't autovivified and supplied token is less
-                    // than current TTL, mark a win.
-                    if ((it->it_flags & ITEM_TOKEN_SENT) == 0
-                            && !item_created
-                            && it->exptime != 0
-                            && it->exptime < of.recache_time) {
-                        won_token = true;
-                    }
-                    break;
-                case 's':
-                    META_CHAR(p, 's');
-                    p = itoa_u32(it->nbytes-2, p);
-                    break;
-                case 't':
-                    // TTL remaining as of this request.
-                    // needs to be relative because server clocks may not be in sync.
-                    META_CHAR(p, 't');
-                    if (it->exptime == 0) {
-                        *p = '-';
-                        *(p+1) = '1';
-                        p += 2;
-                    } else {
-                        p = itoa_u32(it->exptime - current_time, p);
-                    }
-                    break;
-                case 'c':
-                    META_CHAR(p, 'c');
-                    p = itoa_u64(ITEM_get_cas(it), p);
-                    break;
-                case 'f':
-                    META_CHAR(p, 'f');
-                    if (FLAGS_SIZE(it) == 0) {
-                        *p = '0';
-                        p++;
-                    } else {
-                        p = itoa_u32(*((uint32_t *) ITEM_suffix(it)), p);
-                    }
-                    break;
-                case 'l':
-                    META_CHAR(p, 'l');
-                    p = itoa_u32(current_time - it->time, p);
-                    break;
-                case 'h':
-                    META_CHAR(p, 'h');
-                    if (it->it_flags & ITEM_FETCHED) {
-                        *p = '1';
-                    } else {
-                        *p = '0';
-                    }
-                    p++;
-                    break;
-                case 'O':
-                    if (tokens[i].length > MFLAG_MAX_OPAQUE_LENGTH) {
-                        errstr = "CLIENT_ERROR opaque token too long";
-                        goto error;
-                    }
-                    META_SPACE(p);
-                    memcpy(p, tokens[i].value, tokens[i].length);
-                    p += tokens[i].length;
-                    break;
-                case 'k':
-                    META_CHAR(p, 'k');
-                    memcpy(p, ITEM_key(it), it->nkey);
-                    p += it->nkey;
-                    break;
-            }
-        }
-
-        // Has this item already sent a token?
-        // Important to do this here so we don't send W with Z.
-        // Isn't critical, but easier for client authors to understand.
-        if (it->it_flags & ITEM_TOKEN_SENT) {
-            META_CHAR(p, 'Z');
-        }
-        if (it->it_flags & ITEM_STALE) {
-            META_CHAR(p, 'X');
-            // FIXME: think hard about this. is this a default, or a flag?
-            if ((it->it_flags & ITEM_TOKEN_SENT) == 0) {
-                // If we're stale but no token already sent, now send one.
-                won_token = true;
-            }
-        }
-
-        if (won_token) {
-            // Mark a win into the flag buffer.
-            META_CHAR(p, 'W');
-            it->it_flags |= ITEM_TOKEN_SENT;
-        }
-
-        *p = '\r';
-        *(p+1) = '\n';
-        *(p+2) = '\0';
-        p += 2;
-        // finally, chain in the buffer.
-        resp_add_iov(resp, resp->wbuf, p - resp->wbuf);
-
-        if (of.value) {
-#ifdef EXTSTORE
-            if (it->it_flags & ITEM_HDR) {
-                if (_get_extstore(c, it, resp) != 0) {
-                    pthread_mutex_lock(&c->thread->stats.mutex);
-                    c->thread->stats.get_oom_extstore++;
-                    pthread_mutex_unlock(&c->thread->stats.mutex);
-
-                    failed = true;
-                }
-            } else if ((it->it_flags & ITEM_CHUNKED) == 0) {
-                resp_add_iov(resp, ITEM_data(it), it->nbytes);
-            } else {
-                resp_add_chunked_iov(resp, it, it->nbytes);
-            }
-#else
-            if ((it->it_flags & ITEM_CHUNKED) == 0) {
-                resp_add_iov(resp, ITEM_data(it), it->nbytes);
-            } else {
-                resp_add_chunked_iov(resp, it, it->nbytes);
-            }
-#endif
-        }
-
-        // need to hold the ref at least because of the key above.
-#ifdef EXTSTORE
-        if (!failed) {
-            if ((it->it_flags & ITEM_HDR) != 0 && of.value) {
-                // Only have extstore clean if header and returning value.
-                resp->item = NULL;
-            } else {
-                resp->item = it;
-            }
-        } else {
-            // Failed to set up extstore fetch.
-            if (of.locked) {
-                do_item_remove(it);
-            } else {
-                item_remove(it);
-            }
-        }
-#else
-        resp->item = it;
-#endif
-    } else {
-        failed = true;
-    }
-
-    if (of.locked) {
-        // Delayed bump so we could get fetched/last access time pre-update.
-        if (!of.no_update && it != NULL) {
-            do_item_bump(c, it, hv);
-        }
-        item_unlock(hv);
-    }
-
-    // we count this command as a normal one if we've gotten this far.
-    // TODO: for autovivify case, miss never happens. Is this okay?
-    if (!failed) {
-        pthread_mutex_lock(&c->thread->stats.mutex);
-        if (ttl_set) {
-            c->thread->stats.touch_cmds++;
-            c->thread->stats.slab_stats[ITEM_clsid(it)].touch_hits++;
-        } else {
-            c->thread->stats.lru_hits[it->slabs_clsid]++;
-            c->thread->stats.get_cmds++;
-        }
-        pthread_mutex_unlock(&c->thread->stats.mutex);
-
-        conn_set_state(c, conn_new_cmd);
-    } else {
-        pthread_mutex_lock(&c->thread->stats.mutex);
-        if (ttl_set) {
-            c->thread->stats.touch_cmds++;
-            c->thread->stats.touch_misses++;
-        } else {
-            c->thread->stats.get_misses++;
-            c->thread->stats.get_cmds++;
-        }
-        MEMCACHED_COMMAND_GET(c->sfd, key, nkey, -1, 0);
-        pthread_mutex_unlock(&c->thread->stats.mutex);
-
-        // This gets elided in noreply mode.
-        out_string(c, "EN");
-    }
-    return;
-error:
-    if (it) {
-        do_item_remove(it);
-        if (of.locked) {
-            item_unlock(hv);
-        }
-    }
-    out_errstring(c, errstr);
-}
-
-static void process_mset_command(conn *c, token_t *tokens, const size_t ntokens) {
-    char *key;
-    size_t nkey;
-    item *it;
-    int i;
-    short comm = NREAD_SET;
-    struct _meta_flags of = {0}; // option bitflags.
-    char *errstr = "CLIENT_ERROR bad command line format";
-    uint32_t hv;
-    mc_resp *resp = c->resp;
-    char *p = resp->wbuf;
-
-    assert(c != NULL);
-
-    // TODO: most of this is identical to mget.
-    if (tokens[KEY_TOKEN].length > KEY_MAX_LENGTH) {
-        out_errstring(c, "CLIENT_ERROR bad command line format");
-        return;
-    }
-
-    key = tokens[KEY_TOKEN].value;
-    nkey = tokens[KEY_TOKEN].length;
-
-    if (ntokens == 3) {
-        out_errstring(c, "CLIENT_ERROR bad command line format");
-        return;
-    }
-
-    if (ntokens > MFLAG_MAX_OPT_LENGTH) {
-        out_errstring(c, "CLIENT_ERROR options flags too long");
-        return;
-    }
-
-    // leave space for the status code.
-    p = resp->wbuf + 3;
-
-    // We need to at least try to get the size to properly slurp bad bytes
-    // after an error.
-    if (_meta_flag_preparse(tokens, ntokens, &of, &errstr) != 0) {
-        goto error;
-    }
-
-    // Set noreply after tokens are understood.
-    c->noreply = of.no_reply;
-
-    bool has_error = false;
-    for (i = KEY_TOKEN+1; i < ntokens-1; i++) {
-        switch (tokens[i].value[0]) {
-            // TODO: macro perhaps?
-            case 'O':
-                if (tokens[i].length > MFLAG_MAX_OPAQUE_LENGTH) {
-                    errstr = "CLIENT_ERROR opaque token too long";
-                    has_error = true;
-                    break;
-                }
-                META_SPACE(p);
-                memcpy(p, tokens[i].value, tokens[i].length);
-                p += tokens[i].length;
-                break;
-            case 'k':
-                META_CHAR(p, 'k');
-                memcpy(p, key, nkey);
-                p += nkey;
-                break;
-        }
-    }
-
-    // "mode switch" to alternative commands
-    switch (of.mode) {
-        case 0:
-            break; // no mode supplied.
-        case 'E': // Add...
-            comm = NREAD_ADD;
-            break;
-        case 'A': // Append.
-            comm = NREAD_APPEND;
-            break;
-        case 'P': // Prepend.
-            comm = NREAD_PREPEND;
-            break;
-        case 'R': // Replace.
-            comm = NREAD_REPLACE;
-            break;
-        case 'S': // Set. Default.
-            comm = NREAD_SET;
-            break;
-        default:
-            errstr = "CLIENT_ERROR invalid mode for ms M token";
-            goto error;
-    }
-
-    // The item storage function doesn't exactly map to mset.
-    // If a CAS value is supplied, upgrade default SET mode to CAS mode.
-    // Also allows REPLACE to work, as REPLACE + CAS works the same as CAS.
-    // add-with-cas works the same as add; but could only LRU bump if match..
-    // APPEND/PREPEND allow a simplified CAS check.
-    if (of.has_cas && (comm == NREAD_SET || comm == NREAD_REPLACE)) {
-        comm = NREAD_CAS;
-    }
-
-    // We attempt to process as much as we can in hopes of getting a valid and
-    // adjusted vlen, or else the data swallowed after error will be for 0b.
-    if (has_error)
-        goto error;
-
-    it = item_alloc(key, nkey, of.client_flags, of.exptime, of.value_len);
-
-    if (it == 0) {
-        enum store_item_type status;
-        // TODO: These could be normalized codes (TL and OM). Need to
-        // reorganize the output stuff a bit though.
-        if (! item_size_ok(nkey, of.client_flags, of.value_len)) {
-            errstr = "SERVER_ERROR object too large for cache";
-            status = TOO_LARGE;
-        } else {
-            errstr = "SERVER_ERROR out of memory storing object";
-            status = NO_MEMORY;
-        }
-        // FIXME: LOGGER_LOG specific to mset, include options.
-        LOGGER_LOG(c->thread->l, LOG_MUTATIONS, LOGGER_ITEM_STORE,
-                NULL, status, comm, key, nkey, 0, 0);
-
-        /* Avoid stale data persisting in cache because we failed alloc. */
-        // NOTE: only if SET mode?
-        it = item_get_locked(key, nkey, c, DONT_UPDATE, &hv);
-        if (it) {
-            do_item_unlink(it, hv);
-            STORAGE_delete(c->thread->storage, it);
-            do_item_remove(it);
-        }
-        item_unlock(hv);
-
-        goto error;
-    }
-    ITEM_set_cas(it, of.req_cas_id);
-
-    c->item = it;
-#ifdef NEED_ALIGN
-    if (it->it_flags & ITEM_CHUNKED) {
-        c->ritem = ITEM_schunk(it);
-    } else {
-        c->ritem = ITEM_data(it);
-    }
-#else
-    c->ritem = ITEM_data(it);
-#endif
-    c->rlbytes = it->nbytes;
-    c->cmd = comm;
-    if (of.set_stale && comm == NREAD_CAS) {
-        c->set_stale = true;
-    }
-    resp->wbytes = p - resp->wbuf;
-    memcpy(resp->wbuf + resp->wbytes, "\r\n", 2);
-    resp->wbytes += 2;
-    // We've written the status line into wbuf, use wbytes to finalize later.
-    resp_add_iov(resp, resp->wbuf, resp->wbytes);
-    c->mset_res = true;
-    conn_set_state(c, conn_nread);
-    return;
-error:
-    /* swallow the data line */
-    c->sbytes = of.value_len;
-
-    // Note: no errors possible after the item was successfully allocated.
-    // So we're just looking at dumping error codes and returning.
-    out_errstring(c, errstr);
-    // TODO: pass state in? else switching twice meh.
-    conn_set_state(c, conn_swallow);
-}
-
-static void process_mdelete_command(conn *c, token_t *tokens, const size_t ntokens) {
-    char *key;
-    size_t nkey;
-    uint64_t req_cas_id = 0;
-    item *it = NULL;
-    int i;
-    uint32_t hv;
-    struct _meta_flags of = {0}; // option bitflags.
-    char *errstr = "CLIENT_ERROR bad command line format";
-    mc_resp *resp = c->resp;
-    // reserve 3 bytes for status code
-    char *p = resp->wbuf + 3;
-
-    assert(c != NULL);
-
-    // TODO: most of this is identical to mget.
-    if (tokens[KEY_TOKEN].length > KEY_MAX_LENGTH) {
-        out_string(c, "CLIENT_ERROR bad command line format");
-        return;
-    }
-
-    key = tokens[KEY_TOKEN].value;
-    nkey = tokens[KEY_TOKEN].length;
-
-    if (ntokens > MFLAG_MAX_OPT_LENGTH) {
-        out_string(c, "CLIENT_ERROR options flags too long");
-        return;
-    }
-
-    // scrubs duplicated options and sets flags for how to load the item.
-    if (_meta_flag_preparse(tokens, ntokens, &of, &errstr) != 0) {
-        out_errstring(c, "CLIENT_ERROR invalid or duplicate flag");
-        return;
-    }
-    c->noreply = of.no_reply;
-
-    assert(c != NULL);
-    for (i = KEY_TOKEN+1; i < ntokens-1; i++) {
-        switch (tokens[i].value[0]) {
-            // TODO: macro perhaps?
-            case 'O':
-                if (tokens[i].length > MFLAG_MAX_OPAQUE_LENGTH) {
-                    errstr = "CLIENT_ERROR opaque token too long";
-                    goto error;
-                }
-                META_SPACE(p);
-                memcpy(p, tokens[i].value, tokens[i].length);
-                p += tokens[i].length;
-                break;
-            case 'k':
-                META_CHAR(p, 'k');
-                memcpy(p, key, nkey);
-                p += nkey;
-                break;
-        }
-    }
-
-    it = item_get_locked(key, nkey, c, DONT_UPDATE, &hv);
-    if (it) {
-        MEMCACHED_COMMAND_DELETE(c->sfd, ITEM_key(it), it->nkey);
-
-        // allow only deleting/marking if a CAS value matches.
-        if (of.has_cas && ITEM_get_cas(it) != req_cas_id) {
-            pthread_mutex_lock(&c->thread->stats.mutex);
-            c->thread->stats.delete_misses++;
-            pthread_mutex_unlock(&c->thread->stats.mutex);
-
-            memcpy(resp->wbuf, "EX ", 3);
-            goto cleanup;
-        }
-
-        // If we're to set this item as stale, we don't actually want to
-        // delete it. We mark the stale bit, bump CAS, and update exptime if
-        // we were supplied a new TTL.
-        if (of.set_stale) {
-            if (of.new_ttl) {
-                it->exptime = of.exptime;
-            }
-            it->it_flags |= ITEM_STALE;
-            // Also need to remove TOKEN_SENT, so next client can win.
-            it->it_flags &= ~ITEM_TOKEN_SENT;
-
-            ITEM_set_cas(it, (settings.use_cas) ? get_cas_id() : 0);
-
-            // Clients can noreply nominal responses.
-            if (c->noreply)
-                resp->skip = true;
-            memcpy(resp->wbuf, "OK ", 3);
-        } else {
-            pthread_mutex_lock(&c->thread->stats.mutex);
-            c->thread->stats.slab_stats[ITEM_clsid(it)].delete_hits++;
-            pthread_mutex_unlock(&c->thread->stats.mutex);
-
-            do_item_unlink(it, hv);
-            STORAGE_delete(c->thread->storage, it);
-            if (c->noreply)
-                resp->skip = true;
-            memcpy(resp->wbuf, "OK ", 3);
-        }
-        goto cleanup;
-    } else {
-        pthread_mutex_lock(&c->thread->stats.mutex);
-        c->thread->stats.delete_misses++;
-        pthread_mutex_unlock(&c->thread->stats.mutex);
-
-        memcpy(resp->wbuf, "NF ", 3);
-        goto cleanup;
-    }
-cleanup:
-    if (it) {
-        do_item_remove(it);
-    }
-    // Item is always returned locked, even if missing.
-    item_unlock(hv);
-    resp->wbytes = p - resp->wbuf;
-    memcpy(resp->wbuf + resp->wbytes, "\r\n", 2);
-    resp->wbytes += 2;
-    resp_add_iov(resp, resp->wbuf, resp->wbytes);
-    conn_set_state(c, conn_new_cmd);
-    return;
-error:
-    out_errstring(c, errstr);
-}
-
-static void process_marithmetic_command(conn *c, token_t *tokens, const size_t ntokens) {
-    char *key;
-    size_t nkey;
-    int i;
-    struct _meta_flags of = {0}; // option bitflags.
-    char *errstr = "CLIENT_ERROR bad command line format";
-    mc_resp *resp = c->resp;
-    // no reservation (like del/set) since we post-process the status line.
-    char *p = resp->wbuf;
-
-    // If no argument supplied, incr or decr by one.
-    of.delta = 1;
-    of.initial = 0; // redundant, for clarity.
-    bool incr = true; // default mode is to increment.
-    bool locked = false;
-    uint32_t hv = 0;
-    item *it = NULL; // item returned by do_add_delta.
-
-    assert(c != NULL);
-
-    // TODO: most of this is identical to mget.
-    if (tokens[KEY_TOKEN].length > KEY_MAX_LENGTH) {
-        out_string(c, "CLIENT_ERROR bad command line format");
-        return;
-    }
-
-    key = tokens[KEY_TOKEN].value;
-    nkey = tokens[KEY_TOKEN].length;
-
-    if (ntokens > MFLAG_MAX_OPT_LENGTH) {
-        out_string(c, "CLIENT_ERROR options flags too long");
-        return;
-    }
-
-    // scrubs duplicated options and sets flags for how to load the item.
-    if (_meta_flag_preparse(tokens, ntokens, &of, &errstr) != 0) {
-        out_errstring(c, "CLIENT_ERROR invalid or duplicate flag");
-        return;
-    }
-    c->noreply = of.no_reply;
-
-    assert(c != NULL);
-    // "mode switch" to alternative commands
-    switch (of.mode) {
-        case 0: // no switch supplied.
-            break;
-        case 'I': // Incr (default)
-        case '+':
-            incr = true;
-            break;
-        case 'D': // Decr.
-        case '-':
-            incr = false;
-            break;
-        default:
-            errstr = "CLIENT_ERROR invalid mode for ma M token";
-            goto error;
-            break;
-    }
-
-    // take hash value and manually lock item... hold lock during store phase
-    // on miss and avoid recalculating the hash multiple times.
-    hv = hash(key, nkey);
-    item_lock(hv);
-    locked = true;
-    char tmpbuf[INCR_MAX_STORAGE_LEN];
-
-    // return a referenced item if it exists, so we can modify it here, rather
-    // than adding even more parameters to do_add_delta.
-    bool item_created = false;
-    switch(do_add_delta(c, key, nkey, incr, of.delta, tmpbuf, &of.req_cas_id, hv, &it)) {
-    case OK:
-        if (c->noreply)
-            resp->skip = true;
-        memcpy(resp->wbuf, "OK ", 3);
-        break;
-    case NON_NUMERIC:
-        errstr = "CLIENT_ERROR cannot increment or decrement non-numeric value";
-        goto error;
-        break;
-    case EOM:
-        errstr = "SERVER_ERROR out of memory";
-        goto error;
-        break;
-    case DELTA_ITEM_NOT_FOUND:
-        if (of.vivify) {
-            itoa_u64(of.initial, tmpbuf);
-            int vlen = strlen(tmpbuf);
-
-            it = item_alloc(key, nkey, 0, 0, vlen+2);
-            if (it != NULL) {
-                memcpy(ITEM_data(it), tmpbuf, vlen);
-                memcpy(ITEM_data(it) + vlen, "\r\n", 2);
-                if (do_store_item(it, NREAD_ADD, c, hv)) {
-                    item_created = true;
-                } else {
-                    // Not sure how we can get here if we're holding the lock.
-                    memcpy(resp->wbuf, "NS ", 3);
-                }
-            } else {
-                errstr = "SERVER_ERROR Out of memory allocating new item";
-                goto error;
-            }
-        } else {
-            pthread_mutex_lock(&c->thread->stats.mutex);
-            if (incr) {
-                c->thread->stats.incr_misses++;
-            } else {
-                c->thread->stats.decr_misses++;
-            }
-            pthread_mutex_unlock(&c->thread->stats.mutex);
-            // won't have a valid it here.
-            memcpy(p, "NF ", 3);
-            p += 3;
-        }
-        break;
-    case DELTA_ITEM_CAS_MISMATCH:
-        // also returns without a valid it.
-        memcpy(p, "EX ", 3);
-        p += 3;
-        break;
-    }
-
-    // final loop
-    // allows building the response with information after vivifying from a
-    // miss, or returning a new CAS value after add_delta().
-    if (it) {
-        size_t vlen = strlen(tmpbuf);
-        if (of.value) {
-            memcpy(p, "VA ", 3);
-            p = itoa_u32(vlen, p+3);
-        } else {
-            memcpy(p, "OK", 2);
-            p += 2;
-        }
-
-        for (i = KEY_TOKEN+1; i < ntokens-1; i++) {
-            switch (tokens[i].value[0]) {
-                case 'c':
-                    META_CHAR(p, 'c');
-                    p = itoa_u64(ITEM_get_cas(it), p);
-                    break;
-                case 't':
-                    META_CHAR(p, 't');
-                    if (it->exptime == 0) {
-                        *p = '-';
-                        *(p+1) = '1';
-                        p += 2;
-                    } else {
-                        p = itoa_u32(it->exptime - current_time, p);
-                    }
-                    break;
-                case 'T':
-                    it->exptime = of.exptime;
-                    break;
-                case 'N':
-                    if (item_created) {
-                        it->exptime = of.autoviv_exptime;
-                    }
-                    break;
-                // TODO: macro perhaps?
-                case 'O':
-                    if (tokens[i].length > MFLAG_MAX_OPAQUE_LENGTH) {
-                        errstr = "CLIENT_ERROR opaque token too long";
-                        goto error;
-                    }
-                    META_SPACE(p);
-                    memcpy(p, tokens[i].value, tokens[i].length);
-                    p += tokens[i].length;
-                    break;
-                case 'k':
-                    META_CHAR(p, 'k');
-                    memcpy(p, key, nkey);
-                    p += nkey;
-                    break;
-            }
-        }
-
-        if (of.value) {
-            *p = '\r';
-            *(p+1) = '\n';
-            p += 2;
-            memcpy(p, tmpbuf, vlen);
-            p += vlen;
-        }
-
-        do_item_remove(it);
-    } else {
-        // No item to handle. still need to return opaque/key tokens
-        for (i = KEY_TOKEN+1; i < ntokens-1; i++) {
-            switch (tokens[i].value[0]) {
-                // TODO: macro perhaps?
-                case 'O':
-                    if (tokens[i].length > MFLAG_MAX_OPAQUE_LENGTH) {
-                        errstr = "CLIENT_ERROR opaque token too long";
-                        goto error;
-                    }
-                    META_SPACE(p);
-                    memcpy(p, tokens[i].value, tokens[i].length);
-                    p += tokens[i].length;
-                    break;
-                case 'k':
-                    META_CHAR(p, 'k');
-                    memcpy(p, key, nkey);
-                    p += nkey;
-                    break;
-            }
-        }
-    }
-
-    item_unlock(hv);
-
-    resp->wbytes = p - resp->wbuf;
-    memcpy(resp->wbuf + resp->wbytes, "\r\n", 2);
-    resp->wbytes += 2;
-    resp_add_iov(resp, resp->wbuf, resp->wbytes);
-    conn_set_state(c, conn_new_cmd);
-    return;
-error:
-    if (it != NULL)
-        do_item_remove(it);
-    if (locked)
-        item_unlock(hv);
-    out_errstring(c, errstr);
-}
-
 
 static void process_update_command(conn *c, token_t *tokens, const size_t ntokens, int comm, bool handle_cas) {
     char *key;
     size_t nkey;
     unsigned int flags;
     int32_t exptime_int = 0;
-    rel_time_t exptime = 0;
+    time_t exptime;
     int vlen;
     uint64_t req_cas_id=0;
     item *it;
@@ -5116,7 +4219,6 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
 
     key = tokens[KEY_TOKEN].value;
     nkey = tokens[KEY_TOKEN].length;
-
     if (! (safe_strtoul(tokens[2].value, (uint32_t *)&flags)
            && safe_strtol(tokens[3].value, &exptime_int)
            && safe_strtol(tokens[4].value, (int32_t *)&vlen))) {
@@ -5124,7 +4226,14 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
         return;
     }
 
-    exptime = realtime(EXPTIME_TO_POSITIVE_TIME(exptime_int));
+    /* Ubuntu 8.04 breaks when I pass exptime to safe_strtol */
+    exptime = exptime_int;
+
+    /* Negative exptimes can underflow and end up immortal. realtime() will
+       immediately expire values that are greater than REALTIME_MAXDELTA, but less
+       than process_started, so lets aim for that. */
+    if (exptime < 0)
+        exptime = REALTIME_MAXDELTA + 1;
 
     // does cas value exist?
     if (handle_cas) {
@@ -5143,9 +4252,18 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
     if (settings.detail_enabled) {
         stats_prefix_record_set(key, nkey);
     }
-
-    it = item_alloc(key, nkey, flags, exptime, vlen);
-
+    //beginning of set
+    /*start = clock();
+    if(set_count == 0){
+	out_file = fopen("/home/brian/full_persistent_memcached/persistent-memcached/memcached-1.5.13/throughput3.txt", "w+");
+	if(out_file == NULL){
+		fprintf(stderr, "NOOOO\n");
+		fprintf(stderr, "%d\n", errno);
+	}
+	set_start = clock();
+    }*/
+    it = item_alloc(key, nkey, flags, realtime(exptime), vlen);
+   // fprintf(stderr, "process update is %s %s\n", ITEM_key(it), ITEM_data(it));
     if (it == 0) {
         enum store_item_type status;
         if (! item_size_ok(nkey, flags, vlen)) {
@@ -5156,9 +4274,9 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
             status = NO_MEMORY;
         }
         LOGGER_LOG(c->thread->l, LOG_MUTATIONS, LOGGER_ITEM_STORE,
-                NULL, status, comm, key, nkey, 0, 0, c->sfd);
+                NULL, status, comm, key, nkey, 0, 0);
         /* swallow the data line */
-        conn_set_state(c, conn_swallow);
+        c->write_and_go = conn_swallow;
         c->sbytes = vlen;
 
         /* Avoid stale data persisting in cache because we failed alloc.
@@ -5174,7 +4292,10 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
 
         return;
     }
+    //fprintf(stderr, "process update is %s %s\n", ITEM_key(it), ITEM_data(it));
+
     ITEM_set_cas(it, req_cas_id);
+    //fprintf(stderr, "process update is %s %s\n", ITEM_key(it), ITEM_data(it));
 
     c->item = it;
 #ifdef NEED_ALIGN
@@ -5189,13 +4310,14 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
     c->rlbytes = it->nbytes;
     c->cmd = comm;
     conn_set_state(c, conn_nread);
+    //fprintf(stderr, "process update is %s %s\n", ITEM_key(it), ITEM_data(it));
+
 }
 
 static void process_touch_command(conn *c, token_t *tokens, const size_t ntokens) {
     char *key;
     size_t nkey;
     int32_t exptime_int = 0;
-    rel_time_t exptime = 0;
     item *it;
 
     assert(c != NULL);
@@ -5215,8 +4337,7 @@ static void process_touch_command(conn *c, token_t *tokens, const size_t ntokens
         return;
     }
 
-    exptime = realtime(EXPTIME_TO_POSITIVE_TIME(exptime_int));
-    it = item_touch(key, nkey, exptime, c);
+    it = item_touch(key, nkey, realtime(exptime_int), c);
     if (it) {
         pthread_mutex_lock(&c->thread->stats.mutex);
         c->thread->stats.touch_cmds++;
@@ -5298,13 +4419,12 @@ static void process_arithmetic_command(conn *c, token_t *tokens, const size_t nt
 enum delta_result_type do_add_delta(conn *c, const char *key, const size_t nkey,
                                     const bool incr, const int64_t delta,
                                     char *buf, uint64_t *cas,
-                                    const uint32_t hv,
-                                    item **it_ret) {
+                                    const uint32_t hv) {
     char *ptr;
     uint64_t value;
     int res;
     item *it;
-
+	fprintf(stderr, "do_add_delta\n");
     it = do_item_get(key, nkey, hv, c, DONT_UPDATE);
     if (!it) {
         return DELTA_ITEM_NOT_FOUND;
@@ -5353,7 +4473,7 @@ enum delta_result_type do_add_delta(conn *c, const char *key, const size_t nkey,
     }
     pthread_mutex_unlock(&c->thread->stats.mutex);
 
-    itoa_u64(value, buf);
+    snprintf(buf, INCR_MAX_STORAGE_LEN, "%llu", (unsigned long long)value);
     res = strlen(buf);
     /* refcount == 2 means we are the only ones holding the item, and it is
      * linked. We hold the item's lock in this function, so refcount cannot
@@ -5373,7 +4493,7 @@ enum delta_result_type do_add_delta(conn *c, const char *key, const size_t nkey,
     } else if (it->refcount > 1) {
         item *new_it;
         uint32_t flags;
-        FLAGS_CONV(it, flags);
+        FLAGS_CONV(settings.inline_ascii_response, it, flags);
         new_it = do_item_alloc(ITEM_key(it), it->nkey, flags, it->exptime, res + 2);
         if (new_it == 0) {
             do_item_remove(it);
@@ -5400,11 +4520,7 @@ enum delta_result_type do_add_delta(conn *c, const char *key, const size_t nkey,
     if (cas) {
         *cas = ITEM_get_cas(it);    /* swap the incoming CAS value */
     }
-    if (it_ret != NULL) {
-        *it_ret = it;
-    } else {
-        do_item_remove(it);         /* release our reference */
-    }
+    do_item_remove(it);         /* release our reference */
     return OK;
 }
 
@@ -5412,10 +4528,10 @@ static void process_delete_command(conn *c, token_t *tokens, const size_t ntoken
     char *key;
     size_t nkey;
     item *it;
-    uint32_t hv;
 
     assert(c != NULL);
-
+    set_count++;
+	  fprintf(stderr,"set count is %d\n", set_count);
     if (ntokens > 3) {
         bool hold_is_zero = strcmp(tokens[KEY_TOKEN+1].value, "0") == 0;
         bool sets_noreply = set_noreply_maybe(c, tokens, ntokens);
@@ -5441,7 +4557,7 @@ static void process_delete_command(conn *c, token_t *tokens, const size_t ntoken
         stats_prefix_record_delete(key, nkey);
     }
 
-    it = item_get_locked(key, nkey, c, DONT_UPDATE, &hv);
+    it = item_get(key, nkey, c, DONT_UPDATE);
     if (it) {
         MEMCACHED_COMMAND_DELETE(c->sfd, ITEM_key(it), it->nkey);
 
@@ -5449,9 +4565,9 @@ static void process_delete_command(conn *c, token_t *tokens, const size_t ntoken
         c->thread->stats.slab_stats[ITEM_clsid(it)].delete_hits++;
         pthread_mutex_unlock(&c->thread->stats.mutex);
 
-        do_item_unlink(it, hv);
+        item_unlink(it);
         STORAGE_delete(c->thread->storage, it);
-        do_item_remove(it);      /* release our reference */
+        item_remove(it);      /* release our reference */
         out_string(c, "DELETED");
     } else {
         pthread_mutex_lock(&c->thread->stats.mutex);
@@ -5460,7 +4576,6 @@ static void process_delete_command(conn *c, token_t *tokens, const size_t ntoken
 
         out_string(c, "NOT_FOUND");
     }
-    item_unlock(hv);
 }
 
 static void process_verbosity_command(conn *c, token_t *tokens, const size_t ntokens) {
@@ -5537,11 +4652,6 @@ static void process_watch_command(conn *c, token_t *tokens, const size_t ntokens
     assert(c != NULL);
 
     set_noreply_maybe(c, tokens, ntokens);
-    if (!settings.watch_enabled) {
-        out_string(c, "CLIENT_ERROR watch commands not allowed");
-        return;
-    }
-
     if (ntokens > 2) {
         for (x = COMMAND_TOKEN + 1; x < ntokens - 1; x++) {
             if ((strcmp(tokens[x].value, "rawcmds") == 0)) {
@@ -5632,7 +4742,7 @@ static void process_lru_command(conn *c, token_t *tokens, const size_t ntokens) 
                 out_string(c, "OK");
             }
         }
-    } else if (strcmp(tokens[1].value, "mode") == 0 && ntokens >= 4 &&
+    } else if (strcmp(tokens[1].value, "mode") == 0 && ntokens >= 3 &&
                settings.lru_maintainer_thread) {
         if (strcmp(tokens[2].value, "flat") == 0) {
             settings.lru_segmented = false;
@@ -5643,7 +4753,7 @@ static void process_lru_command(conn *c, token_t *tokens, const size_t ntokens) 
         } else {
             out_string(c, "ERROR");
         }
-    } else if (strcmp(tokens[1].value, "temp_ttl") == 0 && ntokens >= 4 &&
+    } else if (strcmp(tokens[1].value, "temp_ttl") == 0 && ntokens >= 3 &&
                settings.lru_maintainer_thread) {
         if (!safe_strtol(tokens[2].value, &ttl)) {
             out_string(c, "ERROR");
@@ -5718,14 +4828,6 @@ static void process_extstore_command(conn *c, token_t *tokens, const size_t ntok
     }
 }
 #endif
-// TODO: pipelined commands are incompatible with shifting connections to a
-// side thread. Given this only happens in two instances (watch and
-// lru_crawler metadump) it should be fine for things to bail. It _should_ be
-// unusual for these commands.
-// This is hard to fix since tokenize_command() mutilates the read buffer, so
-// we can't drop out and back in again.
-// Leaving this note here to spend more time on a fix when necessary, or if an
-// opportunity becomes obvious.
 static void process_command(conn *c, char *command) {
 
     token_t tokens[MAX_TOKENS];
@@ -5736,17 +4838,19 @@ static void process_command(conn *c, char *command) {
 
     MEMCACHED_PROCESS_COMMAND_START(c->sfd, c->rcurr, c->rbytes);
 
-    if (settings.verbose > 1)
-        fprintf(stderr, "<%d %s\n", c->sfd, command);
+    //if (settings.verbose > 1)
+    //    fprintf(stderr, "<%d %s\n", c->sfd, command);
 
     /*
      * for commands set/add/replace, we build an item and read the data
      * directly into it, then continue in nread_complete().
      */
 
-    // Prep the response object for this query.
-    if (!resp_start(c)) {
-        conn_set_state(c, conn_closing);
+    c->msgcurr = 0;
+    c->msgused = 0;
+    c->iovused = 0;
+    if (add_msghdr(c) != 0) {
+        out_of_memory(c, "SERVER_ERROR out of memory preparing response");
         return;
     }
 
@@ -5778,22 +4882,6 @@ static void process_command(conn *c, char *command) {
 
         process_get_command(c, tokens, ntokens, true, false);
 
-    } else if (ntokens >= 3 && (strcmp(tokens[COMMAND_TOKEN].value, "mg") == 0)) {
-        process_mget_command(c, tokens, ntokens);
-    } else if (ntokens >= 3 && (strcmp(tokens[COMMAND_TOKEN].value, "ms") == 0)) {
-        process_mset_command(c, tokens, ntokens);
-    } else if (ntokens >= 3 && (strcmp(tokens[COMMAND_TOKEN].value, "md") == 0)) {
-        process_mdelete_command(c, tokens, ntokens);
-    } else if (ntokens >= 2 && (strcmp(tokens[COMMAND_TOKEN].value, "mn") == 0)) {
-        out_string(c, "MN");
-        // mn command forces immediate writeback flush.
-        conn_set_state(c, conn_mwrite);
-        return;
-    } else if (ntokens >= 2 && (strcmp(tokens[COMMAND_TOKEN].value, "ma") == 0)) {
-        process_marithmetic_command(c, tokens, ntokens);
-    } else if (ntokens >= 2 && (strcmp(tokens[COMMAND_TOKEN].value, "me") == 0)) {
-        process_meta_command(c, tokens, ntokens);
-        return;
     } else if ((ntokens == 4 || ntokens == 5) && (strcmp(tokens[COMMAND_TOKEN].value, "decr") == 0)) {
 
         process_arithmetic_command(c, tokens, ntokens, 0);
@@ -5870,8 +4958,7 @@ static void process_command(conn *c, char *command) {
 
     } else if (ntokens == 2 && (strcmp(tokens[COMMAND_TOKEN].value, "quit") == 0)) {
 
-        conn_set_state(c, conn_mwrite);
-        c->close_after_write = true;
+        conn_set_state(c, conn_closing);
 
     } else if (ntokens == 2 && (strcmp(tokens[COMMAND_TOKEN].value, "shutdown") == 0)) {
 
@@ -5961,20 +5048,12 @@ static void process_command(conn *c, char *command) {
                 out_string(c, "ERROR metadump not allowed");
                 return;
             }
-            if (resp_has_stack(c)) {
-                out_string(c, "ERROR cannot pipeline other commands before metadump");
-                return;
-            }
 
             int rv = lru_crawler_crawl(tokens[2].value, CRAWLER_METADUMP,
                     c, c->sfd, LRU_CRAWLER_CAP_REMAINING);
             switch(rv) {
                 case CRAWLER_OK:
-                    // TODO: documentation says this string is returned, but
-                    // it never was before. We never switch to conn_write so
-                    // this o_s call never worked. Need to talk to users and
-                    // decide if removing the OK from docs is fine.
-                    //out_string(c, "OK");
+                    out_string(c, "OK");
                     // TODO: Don't reuse conn_watch here.
                     conn_set_state(c, conn_watch);
                     event_del(&c->event);
@@ -6023,7 +5102,7 @@ static void process_command(conn *c, char *command) {
                     out_string(c, "ERROR failed to start lru crawler thread");
                 }
             } else if ((strcmp(tokens[COMMAND_TOKEN + 1].value, "disable") == 0)) {
-                if (stop_item_crawler_thread(CRAWLER_NOWAIT) == 0) {
+                if (stop_item_crawler_thread() == 0) {
                     out_string(c, "OK");
                 } else {
                     out_string(c, "ERROR failed to stop lru crawler thread");
@@ -6036,10 +5115,6 @@ static void process_command(conn *c, char *command) {
             out_string(c, "ERROR");
         }
     } else if (ntokens > 1 && strcmp(tokens[COMMAND_TOKEN].value, "watch") == 0) {
-        if (resp_has_stack(c)) {
-            out_string(c, "ERROR cannot pipeline other commands before watch");
-            return;
-        }
         process_watch_command(c, tokens, ntokens);
     } else if ((ntokens == 3 || ntokens == 4) && (strcmp(tokens[COMMAND_TOKEN].value, "cache_memlimit") == 0)) {
         process_memlimit_command(c, tokens, ntokens);
@@ -6077,273 +5152,137 @@ static void process_command(conn *c, char *command) {
     return;
 }
 
-static int try_read_command_negotiate(conn *c) {
-    assert(c->protocol == negotiating_prot);
+/*
+ * if we have a complete line in the buffer, process it.
+ */
+static int try_read_command(conn *c) {
     assert(c != NULL);
     assert(c->rcurr <= (c->rbuf + c->rsize));
     assert(c->rbytes > 0);
-
-    if ((unsigned char)c->rbuf[0] == (unsigned char)PROTOCOL_BINARY_REQ) {
-        c->protocol = binary_prot;
-        c->try_read_command = try_read_command_binary;
-    } else {
-        // authentication doesn't work with negotiated protocol.
-        c->protocol = ascii_prot;
-        c->try_read_command = try_read_command_ascii;
-    }
-
-    if (settings.verbose > 1) {
-        fprintf(stderr, "%d: Client using the %s protocol\n", c->sfd,
-                prot_text(c->protocol));
-    }
-
-    return c->try_read_command(c);
-}
-
-static int try_read_command_udp(conn *c) {
-    assert(c != NULL);
-    assert(c->rcurr <= (c->rbuf + c->rsize));
-    assert(c->rbytes > 0);
-
-    if ((unsigned char)c->rbuf[0] == (unsigned char)PROTOCOL_BINARY_REQ) {
-        c->protocol = binary_prot;
-        return try_read_command_binary(c);
-    } else {
-        c->protocol = ascii_prot;
-        return try_read_command_ascii(c);
-    }
-}
-
-static int try_read_command_binary(conn *c) {
-    /* Do we have the complete packet header? */
-    if (c->rbytes < sizeof(c->binary_header)) {
-        /* need more data! */
-        return 0;
-    } else {
-        memcpy(&c->binary_header, c->rcurr, sizeof(c->binary_header));
-        protocol_binary_request_header* req;
-        req = &c->binary_header;
+    //fprintf(stderr, "trying to read\n");
+    if (c->protocol == negotiating_prot || c->transport == udp_transport)  {
+        if ((unsigned char)c->rbuf[0] == (unsigned char)PROTOCOL_BINARY_REQ) {
+            c->protocol = binary_prot;
+        } else {
+            c->protocol = ascii_prot;
+        }
 
         if (settings.verbose > 1) {
-            /* Dump the packet before we convert it to host order */
-            int ii;
-            fprintf(stderr, "<%d Read binary protocol data:", c->sfd);
-            for (ii = 0; ii < sizeof(req->bytes); ++ii) {
-                if (ii % 4 == 0) {
-                    fprintf(stderr, "\n<%d   ", c->sfd);
-                }
-                fprintf(stderr, " 0x%02x", req->bytes[ii]);
-            }
-            fprintf(stderr, "\n");
+            fprintf(stderr, "%d: Client using the %s protocol\n", c->sfd,
+                    prot_text(c->protocol));
         }
+    }
 
-        c->binary_header = *req;
-        c->binary_header.request.keylen = ntohs(req->request.keylen);
-        c->binary_header.request.bodylen = ntohl(req->request.bodylen);
-        c->binary_header.request.cas = ntohll(req->request.cas);
-
-        if (c->binary_header.request.magic != PROTOCOL_BINARY_REQ) {
-            if (settings.verbose) {
-                fprintf(stderr, "Invalid magic:  %x\n",
-                        c->binary_header.request.magic);
-            }
-            conn_set_state(c, conn_closing);
-            return -1;
-        }
-
-        uint8_t extlen = c->binary_header.request.extlen;
-        uint16_t keylen = c->binary_header.request.keylen;
-        if (c->rbytes < keylen + extlen + sizeof(c->binary_header)) {
-            // Still need more bytes. Let try_read_network() realign the
-            // read-buffer and fetch more data as necessary.
+    if (c->protocol == binary_prot) {
+        /* Do we have the complete packet header? */
+        if (c->rbytes < sizeof(c->binary_header)) {
+            /* need more data! */
             return 0;
+        } else {
+#ifdef NEED_ALIGN
+            if (((long)(c->rcurr)) % 8 != 0) {
+                /* must realign input buffer */
+                memmove(c->rbuf, c->rcurr, c->rbytes);
+                c->rcurr = c->rbuf;
+                if (settings.verbose > 1) {
+                    fprintf(stderr, "%d: Realign input buffer\n", c->sfd);
+                }
+            }
+#endif
+            protocol_binary_request_header* req;
+            req = (protocol_binary_request_header*)c->rcurr;
+
+            if (settings.verbose > 1) {
+                /* Dump the packet before we convert it to host order */
+                int ii;
+                fprintf(stderr, "<%d Read binary protocol data:", c->sfd);
+                for (ii = 0; ii < sizeof(req->bytes); ++ii) {
+                    if (ii % 4 == 0) {
+                        fprintf(stderr, "\n<%d   ", c->sfd);
+                    }
+                    fprintf(stderr, " 0x%02x", req->bytes[ii]);
+                }
+                fprintf(stderr, "\n");
+            }
+
+            c->binary_header = *req;
+            c->binary_header.request.keylen = ntohs(req->request.keylen);
+            c->binary_header.request.bodylen = ntohl(req->request.bodylen);
+            c->binary_header.request.cas = ntohll(req->request.cas);
+
+            if (c->binary_header.request.magic != PROTOCOL_BINARY_REQ) {
+                if (settings.verbose) {
+                    fprintf(stderr, "Invalid magic:  %x\n",
+                            c->binary_header.request.magic);
+                }
+                conn_set_state(c, conn_closing);
+                return -1;
+            }
+
+            c->msgcurr = 0;
+            c->msgused = 0;
+            c->iovused = 0;
+            if (add_msghdr(c) != 0) {
+                out_of_memory(c,
+                        "SERVER_ERROR Out of memory allocating headers");
+                return 0;
+            }
+
+            c->cmd = c->binary_header.request.opcode;
+            c->keylen = c->binary_header.request.keylen;
+            c->opaque = c->binary_header.request.opaque;
+            /* clear the returned cas value */
+            c->cas = 0;
+
+            dispatch_bin_command(c);
+
+            c->rbytes -= sizeof(c->binary_header);
+            c->rcurr += sizeof(c->binary_header);
         }
+    } else {
+        char *el, *cont;
 
-        if (!resp_start(c)) {
-            conn_set_state(c, conn_closing);
-            return -1;
-        }
-
-        c->cmd = c->binary_header.request.opcode;
-        c->keylen = c->binary_header.request.keylen;
-        c->opaque = c->binary_header.request.opaque;
-        /* clear the returned cas value */
-        c->cas = 0;
-
-        c->last_cmd_time = current_time;
-        // sigh. binprot has no "largest possible extlen" define, and I don't
-        // want to refactor a ton of code either. Header is only ever used out
-        // of c->binary_header, but the extlen stuff is used for the latter
-        // bytes. Just wastes 24 bytes on the stack this way.
-        char extbuf[sizeof(c->binary_header) + BIN_MAX_EXTLEN];
-        memcpy(extbuf + sizeof(c->binary_header), c->rcurr + sizeof(c->binary_header), extlen);
-        c->rbytes -= sizeof(c->binary_header) + extlen + keylen;
-        c->rcurr += sizeof(c->binary_header) + extlen + keylen;
-
-        dispatch_bin_command(c, extbuf);
-    }
-
-    return 1;
-}
-
-static int try_read_command_asciiauth(conn *c) {
-    token_t tokens[MAX_TOKENS];
-    size_t ntokens;
-    char *cont = NULL;
-
-    if (!c->resp) {
-        if (!resp_start(c)) {
-            conn_set_state(c, conn_closing);
-            return 1;
-        }
-    }
-
-    // TODO: move to another function.
-    if (!c->sasl_started) {
-        char *el;
-        uint32_t size = 0;
-
-        // impossible for the auth command to be this short.
-        if (c->rbytes < 2)
+        if (c->rbytes == 0)
             return 0;
 
         el = memchr(c->rcurr, '\n', c->rbytes);
-
-        // If no newline after 1k, getting junk data, close out.
         if (!el) {
             if (c->rbytes > 1024) {
-                conn_set_state(c, conn_closing);
-                return 1;
-            }
-            return 0;
-        }
+                /*
+                 * We didn't have a '\n' in the first k. This _has_ to be a
+                 * large multiget, if not we should just nuke the connection.
+                 */
+                char *ptr = c->rcurr;
+                while (*ptr == ' ') { /* ignore leading whitespaces */
+                    ++ptr;
+                }
 
-        // Looking for: "set foo 0 0 N\r\nuser pass\r\n"
-        // key, flags, and ttl are ignored. N is used to see if we have the rest.
+                if (ptr - c->rcurr > 100 ||
+                    (strncmp(ptr, "get ", 4) && strncmp(ptr, "gets ", 5))) {
 
-        // so tokenize doesn't walk past into the value.
-        // it's fine to leave the \r in, as strtoul will stop at it.
-        *el = '\0';
-
-        ntokens = tokenize_command(c->rcurr, tokens, MAX_TOKENS);
-        // ensure the buffer is consumed.
-        c->rbytes -= (el - c->rcurr) + 1;
-        c->rcurr += (el - c->rcurr) + 1;
-
-        // final token is a NULL ender, so we have one more than expected.
-        if (ntokens < 6
-                || strcmp(tokens[0].value, "set") != 0
-                || !safe_strtoul(tokens[4].value, &size)) {
-            out_string(c, "CLIENT_ERROR unauthenticated");
-            return 1;
-        }
-
-        // we don't actually care about the key at all; it can be anything.
-        // we do care about the size of the remaining read.
-        c->rlbytes = size + 2;
-
-        c->sasl_started = true; // reuse from binprot sasl, but not sasl :)
-    }
-
-    if (c->rbytes < c->rlbytes) {
-        // need more bytes.
-        return 0;
-    }
-
-    cont = c->rcurr;
-    // advance buffer. no matter what we're stopping.
-    c->rbytes -= c->rlbytes;
-    c->rcurr += c->rlbytes;
-    c->sasl_started = false;
-
-    // must end with \r\n
-    // NB: I thought ASCII sets also worked with just \n, but according to
-    // complete_nread_ascii only \r\n is valid.
-    if (strncmp(cont + c->rlbytes - 2, "\r\n", 2) != 0) {
-        out_string(c, "CLIENT_ERROR bad command line termination");
-        return 1;
-    }
-
-    // payload should be "user pass", so we can use the tokenizer.
-    cont[c->rlbytes - 2] = '\0';
-    ntokens = tokenize_command(cont, tokens, MAX_TOKENS);
-
-    if (ntokens < 3) {
-        out_string(c, "CLIENT_ERROR bad authentication token format");
-        return 1;
-    }
-
-    if (authfile_check(tokens[0].value, tokens[1].value) == 1) {
-        out_string(c, "STORED");
-        c->authenticated = true;
-        c->try_read_command = try_read_command_ascii;
-        pthread_mutex_lock(&c->thread->stats.mutex);
-        c->thread->stats.auth_cmds++;
-        pthread_mutex_unlock(&c->thread->stats.mutex);
-    } else {
-        out_string(c, "CLIENT_ERROR authentication failure");
-        pthread_mutex_lock(&c->thread->stats.mutex);
-        c->thread->stats.auth_cmds++;
-        c->thread->stats.auth_errors++;
-        pthread_mutex_unlock(&c->thread->stats.mutex);
-    }
-
-    return 1;
-}
-
-static int try_read_command_ascii(conn *c) {
-    char *el, *cont;
-
-    if (c->rbytes == 0)
-        return 0;
-
-    el = memchr(c->rcurr, '\n', c->rbytes);
-    if (!el) {
-        if (c->rbytes > 1024) {
-            /*
-             * We didn't have a '\n' in the first k. This _has_ to be a
-             * large multiget, if not we should just nuke the connection.
-             */
-            char *ptr = c->rcurr;
-            while (*ptr == ' ') { /* ignore leading whitespaces */
-                ++ptr;
-            }
-
-            if (ptr - c->rcurr > 100 ||
-                (strncmp(ptr, "get ", 4) && strncmp(ptr, "gets ", 5))) {
-
-                conn_set_state(c, conn_closing);
-                return 1;
-            }
-
-            // ASCII multigets are unbound, so our fixed size rbuf may not
-            // work for this particular workload... For backcompat we'll use a
-            // malloc/realloc/free routine just for this.
-            if (!c->rbuf_malloced) {
-                if (!rbuf_switch_to_malloc(c)) {
                     conn_set_state(c, conn_closing);
                     return 1;
                 }
             }
+
+            return 0;
         }
+        cont = el + 1;
+        if ((el - c->rcurr) > 1 && *(el - 1) == '\r') {
+            el--;
+        }
+        *el = '\0';
 
-        return 0;
+        assert(cont <= (c->rcurr + c->rbytes));
+
+        c->last_cmd_time = current_time;
+        process_command(c, c->rcurr);
+
+        c->rbytes -= (cont - c->rcurr);
+        c->rcurr = cont;
+
+        assert(c->rcurr <= (c->rbuf + c->rsize));
     }
-    cont = el + 1;
-    if ((el - c->rcurr) > 1 && *(el - 1) == '\r') {
-        el--;
-    }
-    *el = '\0';
-
-    assert(cont <= (c->rcurr + c->rbytes));
-
-    c->last_cmd_time = current_time;
-    process_command(c, c->rcurr);
-
-    c->rbytes -= (cont - c->rcurr);
-    c->rcurr = cont;
-
-    assert(c->rcurr <= (c->rbuf + c->rsize));
 
     return 1;
 }
@@ -6403,7 +5342,7 @@ static enum try_read_result try_read_network(conn *c) {
     int res;
     int num_allocs = 0;
     assert(c != NULL);
-
+    //fprintf(stderr, "try read result\n");
     if (c->rcurr != c->rbuf) {
         if (c->rbytes != 0) /* otherwise there's nothing to copy */
             memmove(c->rbuf, c->rcurr, c->rbytes);
@@ -6411,8 +5350,7 @@ static enum try_read_result try_read_network(conn *c) {
     }
 
     while (1) {
-        // TODO: move to rbuf_* func?
-        if (c->rbytes >= c->rsize && c->rbuf_malloced) {
+        if (c->rbytes >= c->rsize) {
             if (num_allocs == 4) {
                 return gotdata;
             }
@@ -6427,7 +5365,7 @@ static enum try_read_result try_read_network(conn *c) {
                 }
                 c->rbytes = 0; /* ignore what we read */
                 out_of_memory(c, "SERVER_ERROR out of memory reading request");
-                c->close_after_write = true;
+                c->write_and_go = conn_closing;
                 return READ_MEMORY_ERROR;
             }
             c->rcurr = c->rbuf = new_rbuf;
@@ -6442,8 +5380,7 @@ static enum try_read_result try_read_network(conn *c) {
             pthread_mutex_unlock(&c->thread->stats.mutex);
             gotdata = READ_DATA_RECEIVED;
             c->rbytes += res;
-            if (res == avail && c->rbuf_malloced) {
-                // Resize rbuf and try a few times if huge ascii multiget.
+            if (res == avail) {
                 continue;
             } else {
                 break;
@@ -6519,127 +5456,6 @@ void do_accept_new_conns(const bool do_accept) {
     }
 }
 
-#define TRANSMIT_ONE_RESP true
-#define TRANSMIT_ALL_RESP false
-static int _transmit_pre(conn *c, struct iovec *iovs, int iovused, bool one_resp) {
-    mc_resp *resp = c->resp_head;
-    while (resp && iovused + resp->iovcnt < IOV_MAX-1) {
-        if (resp->skip) {
-            // Don't actually unchain the resp obj here since it's singly-linked.
-            // Just let the post function handle it linearly.
-            resp = resp->next;
-            continue;
-        }
-        if (resp->chunked_data_iov) {
-            // Handle chunked items specially.
-            // They spend much more time in send so we can be a bit wasteful
-            // in rebuilding iovecs for them.
-            item_chunk *ch = (item_chunk *)ITEM_schunk((item *)resp->iov[resp->chunked_data_iov].iov_base);
-            int x;
-            for (x = 0; x < resp->iovcnt; x++) {
-                // This iov is tracking how far we've copied so far.
-                if (x == resp->chunked_data_iov) {
-                    int done = resp->chunked_total - resp->iov[x].iov_len;
-                    // Start from the len to allow binprot to cut the \r\n
-                    int todo = resp->iov[x].iov_len;
-                    while (ch && todo > 0 && iovused < IOV_MAX-1) {
-                        int skip = 0;
-                        if (!ch->used) {
-                            ch = ch->next;
-                            continue;
-                        }
-                        // Skip parts we've already sent.
-                        if (done >= ch->used) {
-                            done -= ch->used;
-                            ch = ch->next;
-                            continue;
-                        } else if (done) {
-                            skip = done;
-                            done = 0;
-                        }
-                        iovs[iovused].iov_base = ch->data + skip;
-                        // Stupid binary protocol makes this go negative.
-                        iovs[iovused].iov_len = ch->used - skip > todo ? todo : ch->used - skip;
-                        iovused++;
-                        todo -= ch->used - skip;
-                        ch = ch->next;
-                    }
-                } else {
-                    iovs[iovused].iov_base = resp->iov[x].iov_base;
-                    iovs[iovused].iov_len = resp->iov[x].iov_len;
-                    iovused++;
-                }
-                if (iovused >= IOV_MAX-1)
-                    break;
-            }
-        } else {
-            memcpy(&iovs[iovused], resp->iov, sizeof(struct iovec)*resp->iovcnt);
-            iovused += resp->iovcnt;
-        }
-
-        // done looking at first response, walk down the chain.
-        resp = resp->next;
-        // used for UDP mode: UDP cannot send multiple responses per packet.
-        if (one_resp)
-            break;
-    }
-    return iovused;
-}
-
-/*
- * Decrements and completes responses based on how much data was transmitted.
- * Takes the connection and current result bytes.
- */
-static void _transmit_post(conn *c, ssize_t res) {
-    // We've written some of the data. Remove the completed
-    // responses from the list of pending writes.
-    mc_resp *resp = c->resp_head;
-    while (resp) {
-        int x;
-        if (resp->skip) {
-            resp = resp_finish(c, resp);
-            continue;
-        }
-
-        // fastpath check. all small responses should cut here.
-        if (res >= resp->tosend) {
-            res -= resp->tosend;
-            resp = resp_finish(c, resp);
-            continue;
-        }
-
-        // it's fine to re-check iov's that were zeroed out before.
-        for (x = 0; x < resp->iovcnt; x++) {
-            struct iovec *iov = &resp->iov[x];
-            if (res >= iov->iov_len) {
-                resp->tosend -= iov->iov_len;
-                res -= iov->iov_len;
-                iov->iov_len = 0;
-            } else {
-                // Dumb special case for chunked items. Currently tracking
-                // where to inject the chunked item via iov_base.
-                // Extra not-great since chunked items can't be the first
-                // index, so we have to check for non-zero c_d_iov first.
-                if (!resp->chunked_data_iov || x != resp->chunked_data_iov) {
-                    iov->iov_base = (char *)iov->iov_base + res;
-                }
-                iov->iov_len -= res;
-                resp->tosend -= res;
-                res = 0;
-                break;
-            }
-        }
-
-        // are we done with this response object?
-        if (resp->tosend == 0) {
-            resp = resp_finish(c, resp);
-        } else {
-            // Jammed up here. This is the new head.
-            break;
-        }
-    }
-}
-
 /*
  * Transmit the next chunk of data from our list of msgbuf structures.
  *
@@ -6651,192 +5467,61 @@ static void _transmit_post(conn *c, ssize_t res) {
  */
 static enum transmit_result transmit(conn *c) {
     assert(c != NULL);
-    struct iovec iovs[IOV_MAX];
-    struct msghdr msg;
-    int iovused = 0;
 
-    // init the msg.
-    memset(&msg, 0, sizeof(struct msghdr));
-    msg.msg_iov = iovs;
+    if (c->msgcurr < c->msgused &&
+            c->msglist[c->msgcurr].msg_iovlen == 0) {
+        /* Finished writing the current msg; advance to the next. */
+        c->msgcurr++;
+    }
+    if (c->msgcurr < c->msgused) {
+        ssize_t res;
+        struct msghdr *m = &c->msglist[c->msgcurr];
 
-    iovused = _transmit_pre(c, iovs, iovused, TRANSMIT_ALL_RESP);
+        res = c->sendmsg(c, m, 0);
+        if (res > 0) {
+            pthread_mutex_lock(&c->thread->stats.mutex);
+            c->thread->stats.bytes_written += res;
+            pthread_mutex_unlock(&c->thread->stats.mutex);
 
-    // Alright, send.
-    ssize_t res;
-    msg.msg_iovlen = iovused;
-    res = c->sendmsg(c, &msg, 0);
-    if (res >= 0) {
-        pthread_mutex_lock(&c->thread->stats.mutex);
-        c->thread->stats.bytes_written += res;
-        pthread_mutex_unlock(&c->thread->stats.mutex);
+            /* We've written some of the data. Remove the completed
+               iovec entries from the list of pending writes. */
+            while (m->msg_iovlen > 0 && res >= m->msg_iov->iov_len) {
+                res -= m->msg_iov->iov_len;
+                m->msg_iovlen--;
+                m->msg_iov++;
+            }
 
-        // Decrement any partial IOV's and complete any finished resp's.
-        _transmit_post(c, res);
-
-        if (c->resp_head) {
+            /* Might have written just part of the last iovec entry;
+               adjust it so the next write will do the rest. */
+            if (res > 0) {
+                m->msg_iov->iov_base = (caddr_t)m->msg_iov->iov_base + res;
+                m->msg_iov->iov_len -= res;
+            }
             return TRANSMIT_INCOMPLETE;
-        } else {
-            return TRANSMIT_COMPLETE;
         }
-    }
+        if (res == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            if (!update_event(c, EV_WRITE | EV_PERSIST)) {
+                if (settings.verbose > 0)
+                    fprintf(stderr, "Couldn't update event\n");
+                conn_set_state(c, conn_closing);
+                return TRANSMIT_HARD_ERROR;
+            }
+            return TRANSMIT_SOFT_ERROR;
+        }
+        /* if res == 0 or res == -1 and error is not EAGAIN or EWOULDBLOCK,
+           we have a real error, on which we close the connection */
+        if (settings.verbose > 0)
+            perror("Failed to write, and not due to blocking");
 
-    if (res == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-        if (!update_event(c, EV_WRITE | EV_PERSIST)) {
-            if (settings.verbose > 0)
-                fprintf(stderr, "Couldn't update event\n");
+        if (IS_UDP(c->transport))
+            conn_set_state(c, conn_read);
+        else
             conn_set_state(c, conn_closing);
-            return TRANSMIT_HARD_ERROR;
-        }
-        return TRANSMIT_SOFT_ERROR;
-    }
-    /* if res == -1 and error is not EAGAIN or EWOULDBLOCK,
-       we have a real error, on which we close the connection */
-    if (settings.verbose > 0)
-        perror("Failed to write, and not due to blocking");
-
-    conn_set_state(c, conn_closing);
-    return TRANSMIT_HARD_ERROR;
-}
-
-static void build_udp_header(unsigned char *hdr, mc_resp *resp) {
-    // We need to communicate the total number of packets
-    // If this isn't set, it's the first time this response is building a udp
-    // header, so "tosend" must be static.
-    if (!resp->udp_total) {
-        uint32_t total;
-        total = resp->tosend / UDP_MAX_PAYLOAD_SIZE;
-        if (resp->tosend % UDP_MAX_PAYLOAD_SIZE)
-            total++;
-        // The spec doesn't really say what we should do here. It's _probably_
-        // better to bail out?
-        if (total > USHRT_MAX) {
-            total = USHRT_MAX;
-        }
-        resp->udp_total = total;
-    }
-
-    // TODO: why wasn't this hto*'s and casts?
-    // this ends up sending UDP hdr data specifically in host byte order.
-    *hdr++ = resp->request_id / 256;
-    *hdr++ = resp->request_id % 256;
-    *hdr++ = resp->udp_sequence / 256;
-    *hdr++ = resp->udp_sequence % 256;
-    *hdr++ = resp->udp_total / 256;
-    *hdr++ = resp->udp_total % 256;
-    *hdr++ = 0;
-    *hdr++ = 0;
-    resp->udp_sequence++;
-}
-
-/*
- * UDP specific transmit function. Uses its own function rather than check
- * IS_UDP() five times. If we ever implement sendmmsg or similar support they
- * will diverge even more.
- * Does not use TLS.
- *
- * Returns:
- *   TRANSMIT_COMPLETE   All done writing.
- *   TRANSMIT_INCOMPLETE More data remaining to write.
- *   TRANSMIT_SOFT_ERROR Can't write any more right now.
- *   TRANSMIT_HARD_ERROR Can't write (c->state is set to conn_closing)
- */
-static enum transmit_result transmit_udp(conn *c) {
-    assert(c != NULL);
-    struct iovec iovs[IOV_MAX];
-    struct msghdr msg;
-    mc_resp *resp;
-    int iovused = 0;
-    unsigned char udp_hdr[UDP_HEADER_SIZE];
-
-    // We only send one UDP packet per call (ugh), so we can only operate on a
-    // single response at a time.
-    resp = c->resp_head;
-
-    if (!resp) {
+        return TRANSMIT_HARD_ERROR;
+    } else {
         return TRANSMIT_COMPLETE;
     }
-
-    if (resp->skip) {
-        resp = resp_finish(c, resp);
-        return TRANSMIT_INCOMPLETE;
-    }
-
-    // clear the message and initialize it.
-    memset(&msg, 0, sizeof(struct msghdr));
-    msg.msg_iov = iovs;
-
-    // the UDP source to return to.
-    msg.msg_name = &resp->request_addr;
-    msg.msg_namelen = resp->request_addr_size;
-
-    // First IOV is the custom UDP header.
-    iovs[0].iov_base = udp_hdr;
-    iovs[0].iov_len = UDP_HEADER_SIZE;
-    build_udp_header(udp_hdr, resp);
-    iovused++;
-
-    // Fill the IOV's the standard way.
-    // TODO: might get a small speedup if we let it break early with a length
-    // limit.
-    iovused = _transmit_pre(c, iovs, iovused, TRANSMIT_ONE_RESP);
-
-    // Clip the IOV's to the max UDP packet size.
-    // If we add support for send_mmsg, this can be where we split msg's.
-    {
-        int x = 0;
-        int len = 0;
-        for (x = 0; x < iovused; x++) {
-            if (len + iovs[x].iov_len >= UDP_MAX_PAYLOAD_SIZE) {
-                iovs[x].iov_len = UDP_MAX_PAYLOAD_SIZE - len;
-                x++;
-                break;
-            } else {
-                len += iovs[x].iov_len;
-            }
-        }
-        iovused = x;
-    }
-
-    ssize_t res;
-    msg.msg_iovlen = iovused;
-    // NOTE: uses system sendmsg since we have no support for indirect UDP.
-    res = sendmsg(c->sfd, &msg, 0);
-    if (res >= 0) {
-        pthread_mutex_lock(&c->thread->stats.mutex);
-        c->thread->stats.bytes_written += res;
-        pthread_mutex_unlock(&c->thread->stats.mutex);
-
-        // Ignore the header size from forwarding the IOV's
-        res -= UDP_HEADER_SIZE;
-
-        // Decrement any partial IOV's and complete any finished resp's.
-        _transmit_post(c, res);
-
-        if (c->resp_head) {
-            return TRANSMIT_INCOMPLETE;
-        } else {
-            return TRANSMIT_COMPLETE;
-        }
-    }
-
-    if (res == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-        if (!update_event(c, EV_WRITE | EV_PERSIST)) {
-            if (settings.verbose > 0)
-                fprintf(stderr, "Couldn't update event\n");
-            conn_set_state(c, conn_closing);
-            return TRANSMIT_HARD_ERROR;
-        }
-        return TRANSMIT_SOFT_ERROR;
-    }
-    /* if res == -1 and error is not EAGAIN or EWOULDBLOCK,
-       we have a real error, on which we close the connection */
-    if (settings.verbose > 0)
-        perror("Failed to write, and not due to blocking");
-
-    conn_set_state(c, conn_read);
-    return TRANSMIT_HARD_ERROR;
 }
-
 
 /* Does a looped read to fill data chunks */
 /* TODO: restrict number of times this can loop.
@@ -6844,9 +5529,9 @@ static enum transmit_result transmit_udp(conn *c) {
  */
 static int read_into_chunked_item(conn *c) {
     int total = 0;
-    int res;
+    int res = 0;
     assert(c->rcurr != c->ritem);
-
+    //fprintf(stderr, "read into chunked item\n");
     while (c->rlbytes > 0) {
         item_chunk *ch = (item_chunk *)c->ritem;
         if (ch->size == ch->used) {
@@ -6927,7 +5612,7 @@ static void drive_machine(conn *c) {
     socklen_t addrlen;
     struct sockaddr_storage addr;
     int nreqs = settings.reqs_per_event;
-    int res;
+    int res = 0;
     const char *str;
 #ifdef HAVE_ACCEPT4
     static int  use_accept4 = 1;
@@ -6979,22 +5664,14 @@ static void drive_machine(conn *c) {
                 }
             }
 
-            bool reject;
-            if (settings.maxconns_fast) {
-                STATS_LOCK();
-                reject = stats_state.curr_conns + stats_state.reserved_fds >= settings.maxconns - 1;
-                if (reject) {
-                    stats.rejected_conns++;
-                }
-                STATS_UNLOCK();
-            } else {
-                reject = false;
-            }
-
-            if (reject) {
+            if (settings.maxconns_fast &&
+                stats_state.curr_conns + stats_state.reserved_fds >= settings.maxconns - 1) {
                 str = "ERROR Too many open connections\r\n";
                 res = write(sfd, str, strlen(str));
                 close(sfd);
+                STATS_LOCK();
+                stats.rejected_conns++;
+                STATS_UNLOCK();
             } else {
                 void *ssl_v = NULL;
 #ifdef TLS
@@ -7021,17 +5698,13 @@ static void drive_machine(conn *c) {
                     }
                     SSL_set_fd(ssl, sfd);
                     int ret = SSL_accept(ssl);
-                    if (ret <= 0) {
+                    if (ret < 0) {
                         int err = SSL_get_error(ssl, ret);
                         if (err == SSL_ERROR_SYSCALL || err == SSL_ERROR_SSL) {
                             if (settings.verbose) {
                                 fprintf(stderr, "SSL connection failed with error code : %d : %s\n", err, strerror(errno));
                             }
-                            SSL_free(ssl);
                             close(sfd);
-                            STATS_LOCK();
-                            stats.ssl_handshake_errors++;
-                            STATS_UNLOCK();
                             break;
                         }
                     }
@@ -7040,14 +5713,13 @@ static void drive_machine(conn *c) {
 #endif
 
                 dispatch_conn_new(sfd, conn_new_cmd, EV_READ | EV_PERSIST,
-                                     READ_BUFFER_CACHED, c->transport, ssl_v);
+                                     DATA_BUFFER_SIZE, c->transport, ssl_v);
             }
 
             stop = true;
             break;
 
         case conn_waiting:
-            rbuf_release(c);
             if (!update_event(c, EV_READ | EV_PERSIST)) {
                 if (settings.verbose > 0)
                     fprintf(stderr, "Couldn't update event\n");
@@ -7060,18 +5732,7 @@ static void drive_machine(conn *c) {
             break;
 
         case conn_read:
-            if (!IS_UDP(c->transport)) {
-                // Assign a read buffer if necessary.
-                if (!rbuf_alloc(c)) {
-                    // TODO: Some way to allow for temporary failures.
-                    conn_set_state(c, conn_closing);
-                    break;
-                }
-                res = try_read_network(c);
-            } else {
-                // UDP connections always have a static buffer.
-                res = try_read_udp(c);
-            }
+            res = IS_UDP(c->transport) ? try_read_udp(c) : try_read_network(c);
 
             switch (res) {
             case READ_NO_DATA_RECEIVED:
@@ -7089,18 +5750,12 @@ static void drive_machine(conn *c) {
             }
             break;
 
-        case conn_parse_cmd:
-            c->noreply = false;
-            if (c->try_read_command(c) == 0) {
+        case conn_parse_cmd :
+            if (try_read_command(c) == 0) {
                 /* wee need more data! */
-                if (c->resp_head) {
-                    // Buffered responses waiting, flush in the meantime.
-                    conn_set_state(c, conn_mwrite);
-                } else {
-                    conn_set_state(c, conn_waiting);
-                }
+                conn_set_state(c, conn_waiting);
             }
-
+	    //fprintf(stderr, "conn parse command\n");
             break;
 
         case conn_new_cmd:
@@ -7110,9 +5765,6 @@ static void drive_machine(conn *c) {
             --nreqs;
             if (nreqs >= 0) {
                 reset_cmd_handler(c);
-            } else if (c->resp_head) {
-                // flush response pipe on yield.
-                conn_set_state(c, conn_mwrite);
             } else {
                 pthread_mutex_lock(&c->thread->stats.mutex);
                 c->thread->stats.conn_yields++;
@@ -7137,6 +5789,7 @@ static void drive_machine(conn *c) {
 
         case conn_nread:
             if (c->rlbytes == 0) {
+		//fprintf(stderr, "nread is %s\n", ITEM_data((item*)c->item)   );
                 complete_nread(c);
                 break;
             }
@@ -7150,11 +5803,14 @@ static void drive_machine(conn *c) {
                 break;
             }
 
-            if ((((item *)c->item)->it_flags & ITEM_CHUNKED) == 0) {
+            if (!c->item || (((item *)c->item)->it_flags & ITEM_CHUNKED) == 0) {
                 /* first check if we have leftovers in the conn_read buffer */
+		//fprintf(stderr, "try read loop\n");
                 if (c->rbytes > 0) {
                     int tocopy = c->rbytes > c->rlbytes ? c->rlbytes : c->rbytes;
-                    memmove(c->ritem, c->rcurr, tocopy);
+                    if (c->ritem != c->rcurr) {
+                        memmove(c->ritem, c->rcurr, tocopy);
+                    }
                     c->ritem += tocopy;
                     c->rlbytes -= tocopy;
                     c->rcurr += tocopy;
@@ -7163,9 +5819,15 @@ static void drive_machine(conn *c) {
                         break;
                     }
                 }
+		//fprintf(stderr, "try read is %s\n", c->ritem   );
 
                 /*  now try reading from the socket */
+		//fprintf(stderr, "try reading from socket\n");
+		TX_BEGIN(settings.pm_pool){
+		//pmemobj_tx_add_range_direct(c->ritem, c->rlbytes);
                 res = c->read(c, c->ritem, c->rlbytes);
+		}TX_END
+	 		//fprintf(stderr, "after read is %s\n", c->ritem );
                 if (res > 0) {
                     pthread_mutex_lock(&c->thread->stats.mutex);
                     c->thread->stats.bytes_read += res;
@@ -7182,7 +5844,6 @@ static void drive_machine(conn *c) {
                 if (res > 0)
                     break;
             }
-
             if (res == 0) { /* end of stream */
                 conn_set_state(c, conn_closing);
                 break;
@@ -7203,12 +5864,7 @@ static void drive_machine(conn *c) {
             if (res == -2) {
                 out_of_memory(c, "SERVER_ERROR Out of memory during read");
                 c->sbytes = c->rlbytes;
-                conn_set_state(c, conn_swallow);
-                // Ensure this flag gets cleared. It gets killed on conn_new()
-                // so any conn_closing is fine, calling complete_nread is
-                // fine. This swallow semms to be the only other case.
-                c->set_stale = false;
-                c->mset_res = false;
+                c->write_and_go = conn_swallow;
                 break;
             }
             /* otherwise we have a real error, on which we close the connection */
@@ -7269,6 +5925,22 @@ static void drive_machine(conn *c) {
             break;
 
         case conn_write:
+            /*
+             * We want to write out a simple response. If we haven't already,
+             * assemble it into a msgbuf list (this will be a single-entry
+             * list for TCP or a two-entry list for UDP).
+             */
+            if (c->iovused == 0 || (IS_UDP(c->transport) && c->iovused == 1)) {
+                if (add_iov(c, c->wcurr, c->wbytes) != 0) {
+                    if (settings.verbose > 0)
+                        fprintf(stderr, "Couldn't build response\n");
+                    conn_set_state(c, conn_closing);
+                    break;
+                }
+            }
+
+            /* fall through... */
+
         case conn_mwrite:
 #ifdef EXTSTORE
             /* have side IO's that must process before transmit() can run.
@@ -7287,15 +5959,28 @@ static void drive_machine(conn *c) {
                 break;
             }
 #endif
-            switch (!IS_UDP(c->transport) ? transmit(c) : transmit_udp(c)) {
+          if (IS_UDP(c->transport) && c->msgcurr == 0 && build_udp_headers(c) != 0) {
+            if (settings.verbose > 0)
+              fprintf(stderr, "Failed to build UDP headers\n");
+            conn_set_state(c, conn_closing);
+            break;
+          }
+            switch (transmit(c)) {
             case TRANSMIT_COMPLETE:
                 if (c->state == conn_mwrite) {
-                    // Free up IO wraps and any half-uploaded items.
                     conn_release_items(c);
-                    conn_set_state(c, conn_new_cmd);
-                    if (c->close_after_write) {
-                        conn_set_state(c, conn_closing);
+                    /* XXX:  I don't know why this wasn't the general case */
+                    if(c->protocol == binary_prot) {
+                        conn_set_state(c, c->write_and_go);
+                    } else {
+                        conn_set_state(c, conn_new_cmd);
                     }
+                } else if (c->state == conn_write) {
+                    if (c->write_and_free) {
+                        free(c->write_and_free);
+                        c->write_and_free = 0;
+                    }
+                    conn_set_state(c, c->write_and_go);
                 } else {
                     if (settings.verbose > 0)
                         fprintf(stderr, "Unexpected state %d\n", c->state);
@@ -7545,16 +6230,7 @@ static int server_socket(const char *interface,
                  * among threads, so this is guaranteed to assign one
                  * FD to each thread.
                  */
-                int per_thread_fd;
-                if (c == 0) {
-                    per_thread_fd = sfd;
-                } else {
-                    per_thread_fd = dup(sfd);
-                    if (per_thread_fd < 0) {
-                        perror("Failed to duplicate file descriptor");
-                        exit(EXIT_FAILURE);
-                    }
-                }
+                int per_thread_fd = c ? dup(sfd) : sfd;
                 dispatch_conn_new(per_thread_fd, conn_read,
                                   EV_READ | EV_PERSIST,
                                   UDP_READ_BUFFER_SIZE, transport, NULL);
@@ -7613,7 +6289,6 @@ static int server_sockets(int port, enum network_transport transport,
             if (strncmp(p, notls, strlen(notls)) == 0) {
                 if (!settings.ssl_enabled) {
                     fprintf(stderr, "'notls' option is valid only when SSL is enabled\n");
-                    free(list);
                     return 1;
                 }
                 ssl_enabled = false;
@@ -7754,10 +6429,6 @@ static int server_socket_unix(const char *path, int access_mask) {
  */
 volatile rel_time_t current_time;
 static struct event clockevent;
-#if defined(HAVE_CLOCK_GETTIME) && defined(CLOCK_MONOTONIC)
-static bool monotonic = false;
-static int64_t monotonic_start;
-#endif
 
 /* libevent uses a monotonic clock when available for event scheduling. Aside
  * from jitter, simply ticking our internal timer here is accurate enough.
@@ -7766,24 +6437,30 @@ static int64_t monotonic_start;
 static void clock_handler(const int fd, const short which, void *arg) {
     struct timeval t = {.tv_sec = 1, .tv_usec = 0};
     static bool initialized = false;
+#if defined(HAVE_CLOCK_GETTIME) && defined(CLOCK_MONOTONIC)
+    static bool monotonic = false;
+    static time_t monotonic_start;
+#endif
 
     if (initialized) {
         /* only delete the event if it's actually there. */
         evtimer_del(&clockevent);
     } else {
         initialized = true;
+        /* process_started is initialized to time() - 2. We initialize to 1 so
+         * flush_all won't underflow during tests. */
+#if defined(HAVE_CLOCK_GETTIME) && defined(CLOCK_MONOTONIC)
+        struct timespec ts;
+        if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
+            monotonic = true;
+            monotonic_start = ts.tv_sec - ITEM_UPDATE_INTERVAL - 2;
+        }
+#endif
     }
 
     // While we're here, check for hash table expansion.
     // This function should be quick to avoid delaying the timer.
     assoc_start_expand(stats_state.curr_items);
-    // also, if HUP'ed we need to do some maintenance.
-    // for now that's just the authfile reload.
-    if (settings.sig_hup) {
-        settings.sig_hup = false;
-
-        authfile_load(settings.auth_file);
-    }
 
     evtimer_set(&clockevent, clock_handler, 0);
     event_base_set(main_base, &clockevent);
@@ -7805,25 +6482,13 @@ static void clock_handler(const int fd, const short which, void *arg) {
     }
 }
 
-static const char* flag_enabled_disabled(bool flag) {
-    return (flag ? "enabled" : "disabled");
-}
-
-static void verify_default(const char* param, bool condition) {
-    if (!condition) {
-        printf("Default value of [%s] has changed."
-            " Modify the help text and default value check.\n", param);
-        exit(EXIT_FAILURE);
-    }
-}
-
 static void usage(void) {
     printf(PACKAGE " " VERSION "\n");
-    printf("-p, --port=<num>          TCP port to listen on (default: %d)\n"
-           "-U, --udp-port=<num>      UDP port to listen on (default: %d, off)\n"
+    printf("-p, --port=<num>          TCP port to listen on (default: 11211)\n"
+           "-U, --udp-port=<num>      UDP port to listen on (default: 0, off)\n"
            "-s, --unix-socket=<file>  UNIX socket to listen on (disables network support)\n"
            "-A, --enable-shutdown     enable ascii \"shutdown\" command\n"
-           "-a, --unix-mask=<mask>    access mask for UNIX socket, in octal (default: %o)\n"
+           "-a, --unix-mask=<mask>    access mask for UNIX socket, in octal (default: 0700)\n"
            "-l, --listen=<addr>       interface to listen on (default: INADDR_ANY)\n"
 #ifdef TLS
            "                          if TLS/SSL is enabled, 'notls' prefix can be used to\n"
@@ -7832,9 +6497,9 @@ static void usage(void) {
            "-d, --daemon              run as a daemon\n"
            "-r, --enable-coredumps    maximize core file limit\n"
            "-u, --user=<user>         assume identity of <username> (only when run as root)\n"
-           "-m, --memory-limit=<num>  item memory in megabytes (default: %lu)\n"
+           "-m, --memory-limit=<num>  item memory in megabytes (default: 64 MB)\n"
            "-M, --disable-evictions   return error on memory exhausted instead of evicting\n"
-           "-c, --conn-limit=<num>    max simultaneous connections (default: %d)\n"
+           "-c, --conn-limit=<num>    max simultaneous connections (default: 1024)\n"
            "-k, --lock-memory         lock down all paged memory\n"
            "-v, --verbose             verbose (print errors/warnings while in event loop)\n"
            "-vv                       very verbose (also print client commands/responses)\n"
@@ -7843,147 +6508,106 @@ static void usage(void) {
            "-i, --license             print memcached and libevent license\n"
            "-V, --version             print version and exit\n"
            "-P, --pidfile=<file>      save PID in <file>, only used with -d option\n"
-           "-f, --slab-growth-factor=<num> chunk size growth factor (default: %2.2f)\n"
-           "-n, --slab-min-size=<bytes> min space used for key+value+flags (default: %d)\n",
-           settings.port, settings.udpport, settings.access, (unsigned long) settings.maxbytes / (1 << 20),
-           settings.maxconns, settings.factor, settings.chunk_size);
-    verify_default("udp-port",settings.udpport == 0);
+           "-f, --slab-growth-factor=<num> chunk size growth factor (default: 1.25)\n"
+           "-n, --slab-min-size=<bytes> min space used for key+value+flags (default: 48)\n");
     printf("-L, --enable-largepages  try to use large memory pages (if available)\n");
     printf("-D <char>     Use <char> as the delimiter between key prefixes and IDs.\n"
            "              This is used for per-prefix stats reporting. The default is\n"
-           "              \"%c\" (colon). If this option is specified, stats collection\n"
+           "              \":\" (colon). If this option is specified, stats collection\n"
            "              is turned on automatically; if not, then it may be turned on\n"
-           "              by sending the \"stats detail on\" command to the server.\n",
-           settings.prefix_delimiter);
-    printf("-t, --threads=<num>       number of threads to use (default: %d)\n", settings.num_threads);
+           "              by sending the \"stats detail on\" command to the server.\n");
+    printf("-t, --threads=<num>       number of threads to use (default: 4)\n");
     printf("-R, --max-reqs-per-event  maximum number of requests per event, limits the\n"
            "                          requests processed per connection to prevent \n"
-           "                          starvation (default: %d)\n", settings.reqs_per_event);
+           "                          starvation (default: 20)\n");
     printf("-C, --disable-cas         disable use of CAS\n");
-    printf("-b, --listen-backlog=<num> set the backlog queue limit (default: %d)\n", settings.backlog);
-    printf("-B, --protocol=<name>     protocol - one of ascii, binary, or auto (default: %s)\n",
-           prot_text(settings.binding_protocol));
+    printf("-b, --listen-backlog=<num> set the backlog queue limit (default: 1024)\n");
+    printf("-B, --protocol=<name>     protocol - one of ascii, binary, or auto (default)\n");
     printf("-I, --max-item-size=<num> adjusts max item size\n"
-           "                          (default: %dm, min: %dk, max: %dm)\n",
-           settings.item_size_max/ (1 << 20), ITEM_SIZE_MAX_LOWER_LIMIT / (1 << 10),  ITEM_SIZE_MAX_UPPER_LIMIT / (1 << 20));
+           "                          (default: 1mb, min: 1k, max: 128m)\n");
 #ifdef ENABLE_SASL
     printf("-S, --enable-sasl         turn on Sasl authentication\n");
 #endif
     printf("-F, --disable-flush-all   disable flush_all command\n");
     printf("-X, --disable-dumping     disable stats cachedump and lru_crawler metadump\n");
-    printf("-W  --disable-watch       disable watch commands (live logging)\n");
-    printf("-Y, --auth-file=<file>    (EXPERIMENTAL) enable ASCII protocol authentication. format:\n"
-           "                          user:pass\\nuser2:pass2\\n\n");
-    printf("-e, --memory-file=<file>  (EXPERIMENTAL) mmap a file for item memory.\n"
-           "                          use only in ram disks or persistent memory mounts!\n"
-           "                          enables restartable cache (stop with SIGUSR1)\n");
 #ifdef TLS
     printf("-Z, --enable-ssl          enable TLS/SSL\n");
 #endif
     printf("-o, --extended            comma separated list of extended options\n"
            "                          most options have a 'no_' prefix to disable\n"
-           "   - maxconns_fast:       immediately close new connections after limit (default: %s)\n"
+           "   - maxconns_fast:       immediately close new connections after limit\n"
            "   - hashpower:           an integer multiplier for how large the hash\n"
-           "                          table should be. normally grows at runtime. (default starts at: %d)\n"
+           "                          table should be. normally grows at runtime.\n"
            "                          set based on \"STAT hash_power_level\"\n"
            "   - tail_repair_time:    time in seconds for how long to wait before\n"
            "                          forcefully killing LRU tail item.\n"
            "                          disabled by default; very dangerous option.\n"
            "   - hash_algorithm:      the hash table algorithm\n"
            "                          default is murmur3 hash. options: jenkins, murmur3\n"
-           "   - no_lru_crawler:      disable LRU Crawler background thread.\n"
+           "   - lru_crawler:         enable LRU Crawler background thread\n"
            "   - lru_crawler_sleep:   microseconds to sleep between items\n"
-           "                          default is %d.\n"
+           "                          default is 100.\n"
            "   - lru_crawler_tocrawl: max items to crawl per slab per run\n"
-           "                          default is %u (unlimited)\n",
-           flag_enabled_disabled(settings.maxconns_fast), settings.hashpower_init,
-           settings.lru_crawler_sleep, settings.lru_crawler_tocrawl);
-    printf("   - resp_obj_mem_limit:  limit in megabytes for connection response objects.\n"
-           "                          do not adjust unless you have high (100k+) conn. limits.\n"
-           "                          0 means unlimited (default: %u)\n"
-           "   - read_buf_mem_limit:  limit in megabytes for connection read buffers.\n"
-           "                          do not adjust unless you have high (100k+) conn. limits.\n"
-           "                          0 means unlimited (default: %u)\n",
-           settings.resp_obj_mem_limit,
-           settings.read_buf_mem_limit);
-    verify_default("resp_obj_mem_limit", settings.resp_obj_mem_limit == 0);
-    verify_default("read_buf_mem_limit", settings.read_buf_mem_limit == 0);
-    printf("   - no_lru_maintainer:   disable new LRU system + background thread.\n"
+           "                          default is 0 (unlimited)\n"
+           "   - lru_maintainer:      enable new LRU system + background thread\n"
            "   - hot_lru_pct:         pct of slab memory to reserve for hot lru.\n"
-           "                          (requires lru_maintainer, default pct: %d)\n"
+           "                          (requires lru_maintainer)\n"
            "   - warm_lru_pct:        pct of slab memory to reserve for warm lru.\n"
-           "                          (requires lru_maintainer, default pct: %d)\n"
-           "   - hot_max_factor:      items idle > cold lru age * drop from hot lru. (default: %.2f)\n"
-           "   - warm_max_factor:     items idle > cold lru age * this drop from warm. (default: %.2f)\n"
+           "                          (requires lru_maintainer)\n"
+           "   - hot_max_factor:      items idle > cold lru age * drop from hot lru.\n"
+           "   - warm_max_factor:     items idle > cold lru age * this drop from warm.\n"
            "   - temporary_ttl:       TTL's below get separate LRU, can't be evicted.\n"
-           "                          (requires lru_maintainer, default: %d)\n"
-           "   - idle_timeout:        timeout for idle connections. (default: %d, no timeout)\n",
-           settings.hot_lru_pct, settings.warm_lru_pct, settings.hot_max_factor, settings.warm_max_factor,
-           settings.temporary_ttl, settings.idle_timeout);
-    printf("   - slab_chunk_max:      (EXPERIMENTAL) maximum slab size in kilobytes. use extreme care. (default: %d)\n"
-           "   - watcher_logbuf_size: size in kilobytes of per-watcher write buffer. (default: %u)\n"
+           "                          (requires lru_maintainer)\n"
+           "   - idle_timeout:        timeout for idle connections\n"
+           "   - slab_chunk_max:      (EXPERIMENTAL) maximum slab size. use extreme care.\n"
+           "   - watcher_logbuf_size: size in kilobytes of per-watcher write buffer.\n"
            "   - worker_logbuf_size:  size in kilobytes of per-worker-thread buffer\n"
-           "                          read by background thread, then written to watchers. (default: %u)\n"
+           "                          read by background thread, then written to watchers.\n"
            "   - track_sizes:         enable dynamic reports for 'stats sizes' command.\n"
+           "   - no_inline_ascii_resp: save up to 24 bytes per item.\n"
+           "                           small perf hit in ASCII, no perf difference in\n"
+           "                           binary protocol. speeds up all sets.\n"
            "   - no_hashexpand:       disables hash table expansion (dangerous)\n"
            "   - modern:              enables options which will be default in future.\n"
-           "                          currently: nothing\n"
-           "   - no_modern:           uses defaults of previous major version (1.4.x)\n",
-           settings.slab_chunk_size_max / (1 << 10), settings.logger_watcher_buf_size / (1 << 10),
-           settings.logger_buf_size / (1 << 10));
-    verify_default("tail_repair_time", settings.tail_repair_time == TAIL_REPAIR_TIME_DEFAULT);
-    verify_default("lru_crawler_tocrawl", settings.lru_crawler_tocrawl == 0);
-    verify_default("idle_timeout", settings.idle_timeout == 0);
+           "             currently: nothing\n"
+           "   - no_modern:           uses defaults of previous major version (1.4.x)\n"
 #ifdef HAVE_DROP_PRIVILEGES
-    printf("   - drop_privileges:     enable dropping extra syscall privileges\n"
+           "   - drop_privileges:     enable dropping extra syscall privileges\n"
            "   - no_drop_privileges:  disable drop_privileges in case it causes issues with\n"
            "                          some customisation.\n"
-           "                          (default is no_drop_privileges)\n");
-    verify_default("drop_privileges", !settings.drop_privileges);
 #ifdef MEMCACHED_DEBUG
-    printf("   - relaxed_privileges:  running tests requires extra privileges. (default: %s)\n",
-           flag_enabled_disabled(settings.relaxed_privileges));
+           "   - relaxed_privileges: Running tests requires extra privileges.\n"
 #endif
 #endif
 #ifdef EXTSTORE
-    printf("\n   - External storage (ext_*) related options (see: https://memcached.org/extstore)\n");
-    printf("   - ext_path:            file to write to for external storage.\n"
+           "   - ext_path:            file to write to for external storage.\n"
            "                          ie: ext_path=/mnt/d1/extstore:1G\n"
-           "   - ext_page_size:       size in megabytes of storage pages. (default: %u)\n"
-           "   - ext_wbuf_size:       size in megabytes of page write buffers. (default: %u)\n"
-           "   - ext_threads:         number of IO threads to run. (default: %u)\n"
-           "   - ext_item_size:       store items larger than this (bytes, default %u)\n"
-           "   - ext_item_age:        store items idle at least this long (seconds, default: no age limit)\n"
-           "   - ext_low_ttl:         consider TTLs lower than this specially (default: %u)\n"
-           "   - ext_drop_unread:     don't re-write unread values during compaction (default: %s)\n"
-           "   - ext_recache_rate:    recache an item every N accesses (default: %u)\n"
+           "   - ext_page_size:       size in megabytes of storage pages.\n"
+           "   - ext_wbuf_size:       size in megabytes of page write buffers.\n"
+           "   - ext_threads:         number of IO threads to run.\n"
+           "   - ext_item_size:       store items larger than this (bytes)\n"
+           "   - ext_item_age:        store items idle at least this long\n"
+           "   - ext_low_ttl:         consider TTLs lower than this specially\n"
+           "   - ext_drop_unread:     don't re-write unread values during compaction\n"
+           "   - ext_recache_rate:    recache an item every N accesses\n"
            "   - ext_compact_under:   compact when fewer than this many free pages\n"
-           "                          (default: 1/4th of the assigned storage)\n"
            "   - ext_drop_under:      drop COLD items when fewer than this many free pages\n"
-           "                          (default: 1/4th of the assigned storage)\n"
-           "   - ext_max_frag:        max page fragmentation to tolerate (default: %.2f)\n"
+           "   - ext_max_frag:        max page fragmentation to tolerage\n"
            "   - slab_automove_freeratio: ratio of memory to hold free as buffer.\n"
-           "                          (see doc/storage.txt for more info, default: %.3f)\n",
-           settings.ext_page_size / (1 << 20), settings.ext_wbuf_size / (1 << 20), settings.ext_io_threadcount,
-           settings.ext_item_size, settings.ext_low_ttl,
-           flag_enabled_disabled(settings.ext_drop_unread), settings.ext_recache_rate,
-           settings.ext_max_frag, settings.slab_automove_freeratio);
-    verify_default("ext_item_age", settings.ext_item_age == UINT_MAX);
+           "                          (see doc/storage.txt for more info)\n"
 #endif
 #ifdef TLS
-    printf("   - ssl_chain_cert:      certificate chain file in PEM format\n"
+           "   - ssl_chain_cert:      certificate chain file in PEM format\n"
            "   - ssl_key:             private key, if not part of the -ssl_chain_cert\n"
-           "   - ssl_keyformat:       private key format (PEM, DER or ENGINE) (default: PEM)\n");
-    printf("   - ssl_verify_mode:     peer certificate verification mode, default is 0(None).\n"
+           "   - ssl_keyformat:         private key format (PEM, DER or ENGINE) PEM default\n"
+           "   - ssl_verify_mode:     peer certificate verification mode, default is 0(None).\n"
            "                          valid values are 0(None), 1(Request), 2(Require)\n"
-           "                          or 3(Once)\n");
-    printf("   - ssl_ciphers:         specify cipher list to be used\n"
+           "                          or 3(Once)\n"
+           "   - ssl_ciphers:         specify cipher list to be used\n"
            "   - ssl_ca_cert:         PEM format file of acceptable client CA's\n"
            "   - ssl_wbuf_size:       size in kilobytes of per-connection SSL output buffer\n"
-           "                          (default: %u)\n", settings.ssl_wbuf_size / (1 << 10));
-    verify_default("ssl_keyformat", settings.ssl_keyformat == SSL_FILETYPE_PEM);
-    verify_default("ssl_verify_mode", settings.ssl_verify_mode == SSL_VERIFY_NONE);
 #endif
+           );
     return;
 }
 
@@ -8112,15 +6736,6 @@ static void sig_handler(const int sig) {
     exit(EXIT_SUCCESS);
 }
 
-static void sighup_handler(const int sig) {
-    settings.sig_hup = true;
-}
-
-static void sig_usrhandler(const int sig) {
-    printf("Graceful shutdown signal handled: %s.\n", strsignal(sig));
-    stop_main_loop = true;
-}
-
 #ifndef HAVE_SIGIGNORE
 static int sigignore(int sig) {
     struct sigaction sa = { .sa_handler = SIG_IGN, .sa_flags = 0 };
@@ -8177,21 +6792,6 @@ static int enable_large_pages(void) {
     int ret = stat("/sys/kernel/mm/transparent_hugepage/enabled", &st);
     if (ret || !(st.st_mode & S_IFREG)) {
         fprintf(stderr, "Transparent huge pages support not detected.\n");
-        fprintf(stderr, "Will use default page size.\n");
-        return -1;
-    }
-    return 0;
-#elif defined(__FreeBSD__)
-    int spages;
-    size_t spagesl = sizeof(spages);
-
-    if (sysctlbyname("vm.pmap.pg_ps_enabled", &spages,
-    &spagesl, NULL, 0) != 0) {
-        fprintf(stderr, "Could not evaluate the presence of superpages features.");
-        return -1;
-    }
-    if (spages != 1) {
-        fprintf(stderr, "Superpages support not detected.\n");
         fprintf(stderr, "Will use default page size.\n");
         return -1;
     }
@@ -8261,305 +6861,19 @@ static bool _parse_slab_sizes(char *s, uint32_t *slab_sizes) {
     return true;
 }
 
-struct _mc_meta_data {
-    void *mmap_base;
-    uint64_t old_base;
-    char *slab_config; // string containing either factor or custom slab list.
-    int64_t time_delta;
-    uint64_t process_started;
-    uint32_t current_time;
-};
-
-// We need to remember a combination of configuration settings and global
-// state for restart viability and resumption of internal services.
-// Compared to the number of tunables and state values, relatively little
-// does need to be remembered.
-// Time is the hardest; we have to assume the sys clock is correct and re-sync for
-// the lost time after restart.
-static int _mc_meta_save_cb(const char *tag, void *ctx, void *data) {
-    struct _mc_meta_data *meta = (struct _mc_meta_data *)data;
-
-    // Settings to remember.
-    // TODO: should get a version of version which is numeric, else
-    // comparisons for compat reasons are difficult.
-    // it may be possible to punt on this for now; since we can test for the
-    // absense of another key... such as the new numeric version.
-    //restart_set_kv(ctx, "version", "%s", VERSION);
-    // We hold the original factor or subopts _string_
-    // it can be directly compared without roundtripping through floats or
-    // serializing/deserializing the long options list.
-    restart_set_kv(ctx, "slab_config", "%s", meta->slab_config);
-    restart_set_kv(ctx, "maxbytes", "%llu", (unsigned long long) settings.maxbytes);
-    restart_set_kv(ctx, "chunk_size", "%d", settings.chunk_size);
-    restart_set_kv(ctx, "item_size_max", "%d", settings.item_size_max);
-    restart_set_kv(ctx, "slab_chunk_size_max", "%d", settings.slab_chunk_size_max);
-    restart_set_kv(ctx, "slab_page_size", "%d", settings.slab_page_size);
-    restart_set_kv(ctx, "use_cas", "%s", settings.use_cas ? "true" : "false");
-    restart_set_kv(ctx, "slab_reassign", "%s", settings.slab_reassign ? "true" : "false");
-
-    // Online state to remember.
-
-    // current time is tough. we need to rely on the clock being correct to
-    // pull the delta between stop and start times. we also need to know the
-    // delta between start time and now to restore monotonic clocks.
-    // for non-monotonic clocks (some OS?), process_started is the only
-    // important one.
-    restart_set_kv(ctx, "current_time", "%u", current_time);
-    // types are great until... this. some systems time_t could be big, but
-    // I'm assuming never negative.
-    restart_set_kv(ctx, "process_started", "%llu", (unsigned long long) process_started);
-    {
-        struct timeval tv;
-        gettimeofday(&tv, NULL);
-        restart_set_kv(ctx, "stop_time", "%lu", tv.tv_sec);
-    }
-
-    // Might as well just fetch the next CAS value to use than tightly
-    // coupling the internal variable into the restart system.
-    restart_set_kv(ctx, "current_cas", "%llu", (unsigned long long) get_cas_id());
-    restart_set_kv(ctx, "oldest_cas", "%llu", (unsigned long long) settings.oldest_cas);
-    restart_set_kv(ctx, "logger_gid", "%llu", logger_get_gid());
-    restart_set_kv(ctx, "hashpower", "%u", stats_state.hash_power_level);
-    // NOTE: oldest_live is a rel_time_t, which aliases for unsigned int.
-    // should future proof this with a 64bit upcast, or fetch value from a
-    // converter function/macro?
-    restart_set_kv(ctx, "oldest_live", "%u", settings.oldest_live);
-    // TODO: use uintptr_t etc? is it portable enough?
-    restart_set_kv(ctx, "mmap_oldbase", "%p", meta->mmap_base);
-
-    return 0;
-}
-
-// We must see at least this number of checked lines. Else empty/missing lines
-// could cause a false-positive.
-// TODO: Once crc32'ing of the metadata file is done this could be ensured better by
-// the restart module itself (crc32 + count of lines must match on the
-// backend)
-#define RESTART_REQUIRED_META 17
-
-// With this callback we make a decision on if the current configuration
-// matches up enough to allow reusing the cache.
-// We also re-load important runtime information.
-static int _mc_meta_load_cb(const char *tag, void *ctx, void *data) {
-    struct _mc_meta_data *meta = (struct _mc_meta_data *)data;
-    char *key;
-    char *val;
-    int reuse_mmap = 0;
-    meta->process_started = 0;
-    meta->time_delta = 0;
-    meta->current_time = 0;
-    int lines_seen = 0;
-
-    // TODO: not sure this is any better than just doing an if/else tree with
-    // strcmp's...
-    enum {
-        R_MMAP_OLDBASE = 0,
-        R_MAXBYTES,
-        R_CHUNK_SIZE,
-        R_ITEM_SIZE_MAX,
-        R_SLAB_CHUNK_SIZE_MAX,
-        R_SLAB_PAGE_SIZE,
-        R_SLAB_CONFIG,
-        R_USE_CAS,
-        R_SLAB_REASSIGN,
-        R_CURRENT_CAS,
-        R_OLDEST_CAS,
-        R_OLDEST_LIVE,
-        R_LOGGER_GID,
-        R_CURRENT_TIME,
-        R_STOP_TIME,
-        R_PROCESS_STARTED,
-        R_HASHPOWER,
-    };
-
-    const char *opts[] = {
-        [R_MMAP_OLDBASE] = "mmap_oldbase",
-        [R_MAXBYTES] = "maxbytes",
-        [R_CHUNK_SIZE] = "chunk_size",
-        [R_ITEM_SIZE_MAX] = "item_size_max",
-        [R_SLAB_CHUNK_SIZE_MAX] = "slab_chunk_size_max",
-        [R_SLAB_PAGE_SIZE] = "slab_page_size",
-        [R_SLAB_CONFIG] = "slab_config",
-        [R_USE_CAS] = "use_cas",
-        [R_SLAB_REASSIGN] = "slab_reassign",
-        [R_CURRENT_CAS] = "current_cas",
-        [R_OLDEST_CAS] = "oldest_cas",
-        [R_OLDEST_LIVE] = "oldest_live",
-        [R_LOGGER_GID] = "logger_gid",
-        [R_CURRENT_TIME] = "current_time",
-        [R_STOP_TIME] = "stop_time",
-        [R_PROCESS_STARTED] = "process_started",
-        [R_HASHPOWER] = "hashpower",
-        NULL
-    };
-
-    while (restart_get_kv(ctx, &key, &val) == RESTART_OK) {
-        int type = 0;
-        int32_t val_int = 0;
-        uint32_t val_uint = 0;
-        int64_t bigval_int = 0;
-        uint64_t bigval_uint = 0;
-
-        while (opts[type] != NULL && strcmp(key, opts[type]) != 0) {
-            type++;
-        }
-        if (opts[type] == NULL) {
-            fprintf(stderr, "[restart] unknown/unhandled key: %s\n", key);
-            continue;
-        }
-        lines_seen++;
-
-        // helper for any boolean checkers.
-        bool val_bool = false;
-        bool is_bool = true;
-        if (strcmp(val, "false") == 0) {
-            val_bool = false;
-        } else if (strcmp(val, "true") == 0) {
-            val_bool = true;
-        } else {
-            is_bool = false;
-        }
-
-        switch (type) {
-        case R_MMAP_OLDBASE:
-            if (!safe_strtoull_hex(val, &meta->old_base)) {
-                fprintf(stderr, "[restart] failed to parse %s: %s\n", key, val);
-                reuse_mmap = -1;
-            }
-            break;
-        case R_MAXBYTES:
-            if (!safe_strtoll(val, &bigval_int) || settings.maxbytes != bigval_int) {
-                reuse_mmap = -1;
-            }
-            break;
-        case R_CHUNK_SIZE:
-            if (!safe_strtol(val, &val_int) || settings.chunk_size != val_int) {
-                reuse_mmap = -1;
-            }
-            break;
-        case R_ITEM_SIZE_MAX:
-            if (!safe_strtol(val, &val_int) || settings.item_size_max != val_int) {
-                reuse_mmap = -1;
-            }
-            break;
-        case R_SLAB_CHUNK_SIZE_MAX:
-            if (!safe_strtol(val, &val_int) || settings.slab_chunk_size_max != val_int) {
-                reuse_mmap = -1;
-            }
-            break;
-        case R_SLAB_PAGE_SIZE:
-            if (!safe_strtol(val, &val_int) || settings.slab_page_size != val_int) {
-                reuse_mmap = -1;
-            }
-            break;
-        case R_SLAB_CONFIG:
-            if (strcmp(val, meta->slab_config) != 0) {
-                reuse_mmap = -1;
-            }
-            break;
-        case R_USE_CAS:
-            if (!is_bool || settings.use_cas != val_bool) {
-                reuse_mmap = -1;
-            }
-            break;
-        case R_SLAB_REASSIGN:
-            if (!is_bool || settings.slab_reassign != val_bool) {
-                reuse_mmap = -1;
-            }
-            break;
-        case R_CURRENT_CAS:
-            // FIXME: do we need to fail if these values _aren't_ found?
-            if (!safe_strtoull(val, &bigval_uint)) {
-                reuse_mmap = -1;
-            } else {
-                set_cas_id(bigval_uint);
-            }
-            break;
-        case R_OLDEST_CAS:
-            if (!safe_strtoull(val, &bigval_uint)) {
-                reuse_mmap = -1;
-            } else {
-                settings.oldest_cas = bigval_uint;
-            }
-            break;
-        case R_OLDEST_LIVE:
-            if (!safe_strtoul(val, &val_uint)) {
-                reuse_mmap = -1;
-            } else {
-                settings.oldest_live = val_uint;
-            }
-            break;
-        case R_LOGGER_GID:
-            if (!safe_strtoull(val, &bigval_uint)) {
-                reuse_mmap = -1;
-            } else {
-                logger_set_gid(bigval_uint);
-            }
-            break;
-        case R_PROCESS_STARTED:
-            if (!safe_strtoull(val, &bigval_uint)) {
-                reuse_mmap = -1;
-            } else {
-                meta->process_started = bigval_uint;
-            }
-            break;
-        case R_CURRENT_TIME:
-            if (!safe_strtoul(val, &val_uint)) {
-                reuse_mmap = -1;
-            } else {
-                meta->current_time = val_uint;
-            }
-            break;
-        case R_STOP_TIME:
-            if (!safe_strtoll(val, &bigval_int)) {
-                reuse_mmap = -1;
-            } else {
-                struct timeval t;
-                gettimeofday(&t, NULL);
-                meta->time_delta = t.tv_sec - bigval_int;
-                // clock has done something crazy.
-                // there are _lots_ of ways the clock can go wrong here, but
-                // this is a safe sanity check since there's nothing else we
-                // can realistically do.
-                if (meta->time_delta <= 0) {
-                    reuse_mmap = -1;
-                }
-            }
-            break;
-        case R_HASHPOWER:
-            if (!safe_strtoul(val, &val_uint)) {
-                reuse_mmap = -1;
-            } else {
-                settings.hashpower_init = val_uint;
-            }
-            break;
-        default:
-            fprintf(stderr, "[restart] unhandled key: %s\n", key);
-        }
-
-        if (reuse_mmap != 0) {
-            fprintf(stderr, "[restart] restart incompatible due to setting for [%s] [old value: %s]\n", key, val);
-            break;
-        }
-    }
-
-    if (lines_seen < RESTART_REQUIRED_META) {
-        fprintf(stderr, "[restart] missing some metadata lines\n");
-        reuse_mmap = -1;
-    }
-
-    return reuse_mmap;
-}
-
 int main (int argc, char **argv) {
     int c;
     bool lock_memory = false;
     bool do_daemonize = false;
     bool preallocate = false;
+    //zzz
+    if(settings.static_analysis){
+      start_assoc_maintenance_thread();
+      assoc_expand();
+    }
     int maxcore = 0;
     char *username = NULL;
     char *pid_file = NULL;
-    char *memory_file = NULL;
     struct passwd *pw;
     struct rlimit rlim;
     char *buf;
@@ -8578,10 +6892,6 @@ int main (int argc, char **argv) {
     bool use_slab_sizes = false;
     char *slab_sizes_unparsed = NULL;
     bool slab_chunk_size_changed = false;
-    // struct for restart code. Initialized up here so we can curry
-    // important settings to save or validate.
-    struct _mc_meta_data *meta = malloc(sizeof(struct _mc_meta_data));
-    meta->slab_config = NULL;
 #ifdef EXTSTORE
     void *storage = NULL;
     struct extstore_conf_file *storage_file = NULL;
@@ -8626,8 +6936,6 @@ int main (int argc, char **argv) {
         NO_LRU_MAINTAINER,
         NO_DROP_PRIVILEGES,
         DROP_PRIVILEGES,
-        RESP_OBJ_MEM_LIMIT,
-        READ_BUF_MEM_LIMIT,
 #ifdef TLS
         SSL_CERT,
         SSL_KEY,
@@ -8694,8 +7002,6 @@ int main (int argc, char **argv) {
         [NO_LRU_MAINTAINER] = "no_lru_maintainer",
         [NO_DROP_PRIVILEGES] = "no_drop_privileges",
         [DROP_PRIVILEGES] = "drop_privileges",
-        [RESP_OBJ_MEM_LIMIT] = "resp_obj_mem_limit",
-        [READ_BUF_MEM_LIMIT] = "read_buf_mem_limit",
 #ifdef TLS
         [SSL_CERT] = "ssl_chain_cert",
         [SSL_KEY] = "ssl_key",
@@ -8728,19 +7034,15 @@ int main (int argc, char **argv) {
     };
 
     if (!sanitycheck()) {
-        free(meta);
         return EX_OSERR;
     }
 
     /* handle SIGINT, SIGTERM */
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
-    signal(SIGHUP, sighup_handler);
-    signal(SIGUSR1, sig_usrhandler);
 
     /* init settings */
     settings_init();
-    verify_default("hash_algorithm", hash_type == MURMUR3_HASH);
 #ifdef EXTSTORE
     settings.ext_item_size = 512;
     settings.ext_item_age = UINT_MAX;
@@ -8752,11 +7054,9 @@ int main (int argc, char **argv) {
     settings.ext_compact_under = 0;
     settings.ext_drop_under = 0;
     settings.slab_automove_freeratio = 0.01;
-    settings.ext_page_size = 1024 * 1024 * 64;
-    settings.ext_io_threadcount = 1;
-    ext_cf.page_size = settings.ext_page_size;
+    ext_cf.page_size = 1024 * 1024 * 64;
     ext_cf.wbuf_size = settings.ext_wbuf_size;
-    ext_cf.io_threadcount = settings.ext_io_threadcount;
+    ext_cf.io_threadcount = 1;
     ext_cf.io_depth = 1;
     ext_cf.page_buckets = 4;
     ext_cf.wbuf_count = ext_cf.page_buckets;
@@ -8799,10 +7099,8 @@ int main (int argc, char **argv) {
           "S"   /* Sasl ON */
           "F"   /* Disable flush_all */
           "X"   /* Disable dump commands */
-          "W"   /* Disable watch commands */
-          "Y:"   /* Enable token auth */
-          "e:"  /* mmap path for external item memory */
           "o:"  /* Extended generic options */
+	  "q"   /* Static Analysis Entry Function added by Brian */
           ;
 
     /* process arguments */
@@ -8839,9 +7137,6 @@ int main (int argc, char **argv) {
         {"enable-sasl", no_argument, 0, 'S'},
         {"disable-flush-all", no_argument, 0, 'F'},
         {"disable-dumping", no_argument, 0, 'X'},
-        {"disable-watch", no_argument, 0, 'W'},
-        {"auth-file", required_argument, 0, 'Y'},
-        {"memory-file", required_argument, 0, 'e'},
         {"extended", required_argument, 0, 'o'},
         {0, 0, 0, 0}
     };
@@ -8872,6 +7167,9 @@ int main (int argc, char **argv) {
         case 'U':
             settings.udpport = atoi(optarg);
             udp_specified = true;
+            break;
+        case 'q':
+            settings.static_analysis = 1;
             break;
         case 'p':
             settings.port = atoi(optarg);
@@ -8945,16 +7243,12 @@ int main (int argc, char **argv) {
         case 'P':
             pid_file = optarg;
             break;
-        case 'e':
-            memory_file = optarg;
-            break;
         case 'f':
             settings.factor = atof(optarg);
             if (settings.factor <= 1.0) {
                 fprintf(stderr, "Factor must be greater than 1\n");
                 return 1;
             }
-            meta->slab_config = strdup(optarg);
             break;
         case 'n':
             settings.chunk_size = atoi(optarg);
@@ -8993,7 +7287,7 @@ int main (int argc, char **argv) {
                 preallocate = true;
             } else {
                 fprintf(stderr, "Cannot enable large pages on this system\n"
-                    "(There is no support as of this version)\n");
+                    "(There is no Linux support as of this version)\n");
                 return 1;
             }
             break;
@@ -9046,13 +7340,6 @@ int main (int argc, char **argv) {
             break;
        case 'X' :
             settings.dump_enabled = false;
-            break;
-       case 'W' :
-            settings.watch_enabled = false;
-            break;
-       case 'Y' :
-            // dupe the file path now just in case the options get mangled.
-            settings.auth_file = strdup(optarg);
             break;
         case 'o': /* It's sub-opts time! */
             subopts_orig = subopts = strdup(optarg); /* getsubopt() changes the original args */
@@ -9254,7 +7541,7 @@ int main (int argc, char **argv) {
                 }
                 settings.logger_buf_size *= 1024; /* kilobytes */
             case SLAB_SIZES:
-                slab_sizes_unparsed = strdup(subopts_value);
+                slab_sizes_unparsed = subopts_value;
                 break;
             case SLAB_CHUNK_MAX:
                 if (subopts_value == NULL) {
@@ -9269,8 +7556,10 @@ int main (int argc, char **argv) {
                 item_stats_sizes_init();
                 break;
             case NO_INLINE_ASCII_RESP:
+                settings.inline_ascii_response = false;
                 break;
             case INLINE_ASCII_RESP:
+                settings.inline_ascii_response = true;
                 break;
             case NO_CHUNKED_ITEMS:
                 settings.slab_chunk_size_max = settings.slab_page_size;
@@ -9378,10 +7667,6 @@ int main (int argc, char **argv) {
 #endif
 #ifdef EXTSTORE
             case EXT_PAGE_SIZE:
-                if (storage_file) {
-                    fprintf(stderr, "Must specify ext_page_size before any ext_path arguments\n");
-                    return 1;
-                }
                 if (subopts_value == NULL) {
                     fprintf(stderr, "Missing ext_page_size argument\n");
                     return 1;
@@ -9534,6 +7819,7 @@ int main (int argc, char **argv) {
                 settings.slab_reassign = false;
                 settings.slab_automove = 0;
                 settings.maxconns_fast = false;
+                settings.inline_ascii_response = true;
                 settings.lru_segmented = false;
                 hash_type = JENKINS_HASH;
                 start_lru_crawler = false;
@@ -9544,28 +7830,6 @@ int main (int argc, char **argv) {
                 break;
             case DROP_PRIVILEGES:
                 settings.drop_privileges = true;
-                break;
-            case RESP_OBJ_MEM_LIMIT:
-                if (subopts_value == NULL) {
-                    fprintf(stderr, "Missing resp_obj_mem_limit argument\n");
-                    return 1;
-                }
-                if (!safe_strtoul(subopts_value, &settings.resp_obj_mem_limit)) {
-                    fprintf(stderr, "could not parse argument to resp_obj_mem_limit\n");
-                    return 1;
-                }
-                settings.resp_obj_mem_limit *= 1024 * 1024; /* megabytes */
-                break;
-            case READ_BUF_MEM_LIMIT:
-                if (subopts_value == NULL) {
-                    fprintf(stderr, "Missing read_buf_mem_limit argument\n");
-                    return 1;
-                }
-                if (!safe_strtoul(subopts_value, &settings.read_buf_mem_limit)) {
-                    fprintf(stderr, "could not parse argument to read_buf_mem_limit\n");
-                    return 1;
-                }
-                settings.read_buf_mem_limit *= 1024 * 1024; /* megabytes */
                 break;
 #ifdef MEMCACHED_DEBUG
             case RELAXED_PRIVILEGES:
@@ -9586,7 +7850,7 @@ int main (int argc, char **argv) {
         }
     }
 
-    if (settings.item_size_max < ITEM_SIZE_MAX_LOWER_LIMIT) {
+    if (settings.item_size_max < 1024) {
         fprintf(stderr, "Item max size cannot be less than 1024 bytes.\n");
         exit(EX_USAGE);
     }
@@ -9594,7 +7858,7 @@ int main (int argc, char **argv) {
         fprintf(stderr, "Cannot set item size limit higher than 1/2 of memory max.\n");
         exit(EX_USAGE);
     }
-    if (settings.item_size_max > (ITEM_SIZE_MAX_UPPER_LIMIT)) {
+    if (settings.item_size_max > (1024 * 1024 * 1024)) {
         fprintf(stderr, "Cannot set item size limit higher than a gigabyte.\n");
         exit(EX_USAGE);
     }
@@ -9630,6 +7894,15 @@ int main (int argc, char **argv) {
             exit(EX_USAGE);
         }
 
+        /* This is due to the suffix header being generated with the wrong length
+         * value for the ITEM_HDR replacement. The cuddled nbytes no longer
+         * matches, so we end up losing a few bytes on readback.
+         */
+        if (settings.inline_ascii_response) {
+            fprintf(stderr, "Cannot use inline_ascii_response with extstore enabled\n");
+            exit(EX_USAGE);
+        }
+
         if (settings.udpport) {
             fprintf(stderr, "Cannot use UDP with extstore enabled (-U 0 to disable)\n");
             exit(EX_USAGE);
@@ -9643,20 +7916,11 @@ int main (int argc, char **argv) {
     }*/
 
     if (slab_sizes_unparsed != NULL) {
-        // want the unedited string for restart code.
-        char *temp = strdup(slab_sizes_unparsed);
         if (_parse_slab_sizes(slab_sizes_unparsed, slab_sizes)) {
             use_slab_sizes = true;
-            if (meta->slab_config) {
-                free(meta->slab_config);
-            }
-            meta->slab_config = temp;
         } else {
             exit(EX_USAGE);
         }
-    } else if (!meta->slab_config) {
-        // using the default factor.
-        meta->slab_config = "1.25";
     }
 
     if (settings.hot_lru_pct + settings.warm_lru_pct > 80) {
@@ -9690,22 +7954,6 @@ int main (int argc, char **argv) {
         } else {
             if (settings.binding_protocol != binary_prot) {
                 fprintf(stderr, "ERROR: You cannot allow the ASCII protocol while using SASL.\n");
-                exit(EX_USAGE);
-            }
-        }
-
-        if (settings.udpport) {
-            fprintf(stderr, "ERROR: Cannot enable UDP while using binary SASL authentication.\n");
-            exit(EX_USAGE);
-        }
-    }
-
-    if (settings.auth_file) {
-        if (!protocol_specified) {
-            settings.binding_protocol = ascii_prot;
-        } else {
-            if (settings.binding_protocol != ascii_prot) {
-                fprintf(stderr, "ERROR: You cannot allow the BINARY protocol while using ascii authentication tokens.\n");
                 exit(EX_USAGE);
             }
         }
@@ -9787,18 +8035,8 @@ int main (int argc, char **argv) {
             exit(EX_NOUSER);
         }
         if (setgroups(0, NULL) < 0) {
-            /* setgroups may fail with EPERM, indicating we are already in a
-             * minimally-privileged state. In that case we continue. For all
-             * other failure codes we exit.
-             *
-             * Note that errno is stored here because fprintf may change it.
-             */
-            bool should_exit = errno != EPERM;
-            fprintf(stderr, "failed to drop supplementary groups: %s\n",
-                    strerror(errno));
-            if (should_exit) {
-                exit(EX_OSERR);
-            }
+            fprintf(stderr, "failed to drop supplementary groups\n");
+            exit(EX_OSERR);
         }
         if (setgid(pw->pw_gid) < 0 || setuid(pw->pw_uid) < 0) {
             fprintf(stderr, "failed to assume identity of user %s\n", username);
@@ -9848,74 +8086,60 @@ int main (int argc, char **argv) {
     /* Otherwise, use older API */
     main_base = event_init();
 #endif
-
-    /* Load initial auth file if required */
-    if (settings.auth_file) {
-        if (settings.udpport) {
-            fprintf(stderr, "Cannot use UDP with ascii authentication enabled (-U 0 to disable)\n");
-            exit(EX_USAGE);
-        }
-
-        switch (authfile_load(settings.auth_file)) {
-            case AUTHFILE_MISSING: // fall through.
-            case AUTHFILE_OPENFAIL:
-                vperror("Could not open authfile [%s] for reading", settings.auth_file);
-                exit(EXIT_FAILURE);
-                break;
-            case AUTHFILE_OOM:
-                fprintf(stderr, "Out of memory reading password file: %s", settings.auth_file);
-                exit(EXIT_FAILURE);
-                break;
-            case AUTHFILE_MALFORMED:
-                fprintf(stderr, "Authfile [%s] has a malformed entry. Should be 'user:password'", settings.auth_file);
-                exit(EXIT_FAILURE);
-                break;
-            case AUTHFILE_OK:
-                break;
-        }
-    }
-
+    int recovery = 0;
     /* initialize other stuff */
-    stats_init();
     logger_init();
-    conn_init();
-    bool reuse_mem = false;
-    void *mem_base = NULL;
-    bool prefill = false;
-    if (memory_file != NULL) {
-        preallocate = true;
-        // Easier to manage memory if we prefill the global pool when reusing.
-        prefill = true;
-        restart_register("main", _mc_meta_load_cb, _mc_meta_save_cb, meta);
-        reuse_mem = restart_mmap_open(settings.maxbytes,
-                        memory_file,
-                        &mem_base);
-        // The "save" callback gets called when we're closing out the mmap,
-        // but we don't know what the mmap_base is until after we call open.
-        // So we pass the struct above but have to fill it in here so the
-        // data's available during the save routine.
-        meta->mmap_base = mem_base;
-        // Also, the callbacks for load() run before _open returns, so we
-        // should have the old base in 'meta' as of here.
+    stats_init();
+#ifdef PSLAB
+    PMEMoid pmemoid;
+    if(access("/mnt/pmem/memcached.pm", F_OK) != 0){
+	size_t sisi = INT_MAX;
+	size_t sisi2 =  INT_MAX;
+	sisi = 53 * (sisi + sisi2);
+        settings.pm_pool = pmemobj_create("/mnt/pmem/memcached.pm", "store.db", sisi, 0666);
+ 	if(settings.pm_pool == NULL){
+          printf("pmem pool problem is %s\n", pmemobj_errormsg());
+        }
+        pmemoid = pmemobj_root(settings.pm_pool, sizeof(uint64_t));
+        settings.pool_uuid = pmemoid.pool_uuid_lo;
+        uint64_t *num = pmemobj_direct(pmemoid);
+        *num = (uint64_t)settings.pm_pool;
+         printf("num is %p offset is %ld\n", (void *)num, (uint64_t)num);
     }
-    // Initialize the hash table _after_ checking restart metadata.
-    // We override the hash table start argument with what was live
-    // previously, to avoid filling a huge set of items into a tiny hash
-    // table.
-    assoc_init(settings.hashpower_init);
-#ifdef EXTSTORE
-    if (storage_file && reuse_mem) {
-        fprintf(stderr, "[restart] memory restart with extstore not presently supported.\n");
-        reuse_mem = false;
+    else{
+	recovery = 1;
+    printf("2 before pslab\n");
+        settings.pm_pool = pmemobj_open("/mnt/pmem/memcached.pm", "store.db");
+        //const char *error = pmemobj_errormsg();
+        pmemoid = pmemobj_root(settings.pm_pool, sizeof(uint64_t));
+        uint64_t *num = pmemobj_direct(pmemoid);
+	settings.pool_uuid = pmemoid.pool_uuid_lo;
+	clock_t recover_start = clock();
+        slab_recovery(pmemoid, *num);
+	assoc_recovery(pmemoid, *num);
+	clock_t recover_end = clock();
+	double recover_time = (double)(recover_end - recover_start)/CLOCKS_PER_SEC;
+	fprintf(stderr, "%f\n", recover_time);
+	*num = (uint64_t)settings.pm_pool;
     }
 #endif
-    slabs_init(settings.maxbytes, settings.factor, preallocate,
-            use_slab_sizes ? slab_sizes : NULL, mem_base, reuse_mem);
+    if(!recovery){
+    	assoc_init(settings.hashpower_init);
+   	 conn_init();
+    	slabs_init(settings.maxbytes, settings.factor, preallocate,
+            use_slab_sizes ? slab_sizes : NULL);
+    }
+    else{
+    	//assoc_init(settings.hashpower_init);
+   	 conn_init();
+    	//slabs_init(settings.maxbytes, settings.factor, preallocate,
+        //    use_slab_sizes ? slab_sizes : NULL);
+
+    }
 #ifdef EXTSTORE
     if (storage_file) {
         enum extstore_res eres;
         if (settings.ext_compact_under == 0) {
-            // If changing the default fraction (4), change the help text as well.
             settings.ext_compact_under = storage_file->page_count / 4;
             /* Only rescues non-COLD items if below this threshold */
             settings.ext_drop_under = storage_file->page_count / 4;
@@ -9936,29 +8160,9 @@ int main (int argc, char **argv) {
         }
         ext_storage = storage;
         /* page mover algorithm for extstore needs memory prefilled */
-        prefill = true;
+        slabs_prefill_global();
     }
 #endif
-
-    if (settings.drop_privileges) {
-        setup_privilege_violations_handler();
-    }
-
-    if (prefill)
-        slabs_prefill_global();
-    /* In restartable mode and we've decided to issue a fixup on memory */
-    if (memory_file != NULL && reuse_mem) {
-        mc_ptr_t old_base = meta->old_base;
-        assert(old_base == meta->old_base);
-
-        // should've pulled in process_started from meta file.
-        process_started = meta->process_started;
-        // TODO: must be a more canonical way of serializing/deserializing
-        // pointers? passing through uint64_t should work, and we're not
-        // annotating the pointer with anything, but it's still slightly
-        // insane.
-        restart_fixup((void *)old_base);
-    }
     /*
      * ignore SIGPIPE signals; we can use errno == EPIPE if we
      * need that information
@@ -9999,7 +8203,6 @@ int main (int argc, char **argv) {
     if (start_lru_maintainer && start_lru_maintainer_thread(NULL) != 0) {
 #endif
         fprintf(stderr, "Failed to enable LRU maintainer thread\n");
-        free(meta);
         return 1;
     }
 
@@ -10013,25 +8216,6 @@ int main (int argc, char **argv) {
     }
 
     /* initialise clock event */
-#if defined(HAVE_CLOCK_GETTIME) && defined(CLOCK_MONOTONIC)
-    {
-        struct timespec ts;
-        if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
-            monotonic = true;
-            monotonic_start = ts.tv_sec;
-            // Monotonic clock needs special handling for restarts.
-            // We get a start time at an arbitrary place, so we need to
-            // restore the original time delta, which is always "now" - _start
-            if (reuse_mem) {
-                // the running timespan at stop time + the time we think we
-                // were stopped.
-                monotonic_start -= meta->current_time + meta->time_delta;
-            } else {
-                monotonic_start -= ITEM_UPDATE_INTERVAL + 2;
-            }
-        }
-    }
-#endif
     clock_handler(0, 0, 0);
 
     /* create unix mode sockets after dropping privileges */
@@ -10116,25 +8300,11 @@ int main (int argc, char **argv) {
     uriencode_init();
 
     /* enter the event loop */
-    while (!stop_main_loop) {
-        if (event_base_loop(main_base, EVLOOP_ONCE) != 0) {
-            retval = EXIT_FAILURE;
-            break;
-        }
+    if (event_base_loop(main_base, 0) != 0) {
+        retval = EXIT_FAILURE;
     }
 
-    fprintf(stderr, "Gracefully stopping\n");
-    stop_threads();
-    int i;
-    // FIXME: make a function callable from threads.c
-    for (i = 0; i < max_fds; i++) {
-        if (conns[i] && conns[i]->state != conn_closed) {
-            conn_close(conns[i]);
-        }
-    }
-    if (memory_file != NULL) {
-        restart_mmap_close();
-    }
+    stop_assoc_maintenance_thread();
 
     /* remove the PID file if we're a daemon */
     if (do_daemonize)
@@ -10145,8 +8315,6 @@ int main (int argc, char **argv) {
 
     /* cleanup base */
     event_base_free(main_base);
-
-    free(meta);
 
     return retval;
 }

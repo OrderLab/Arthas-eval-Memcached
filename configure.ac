@@ -86,7 +86,10 @@ AC_ARG_ENABLE(arm_crc32,
   [AS_HELP_STRING([--enable-arm-crc32], [Enable ARMv8 CRC32 instructions])])
 
 AC_ARG_ENABLE(extstore,
-  [AS_HELP_STRING([--disable-extstore], [Disable external storage (extstore)])])
+  [AS_HELP_STRING([--enable-extstore], [Enable external storage EXPERIMENTAL ])])
+
+AC_ARG_ENABLE(pslab,
+  [AS_HELP_STRING([--enable-pslab], [Enable persistent memory slab EXPERIMENTAL ])])
 
 AC_ARG_ENABLE(seccomp,
   [AS_HELP_STRING([--enable-seccomp],[Enable seccomp restrictions EXPERIMENTAL])])
@@ -103,9 +106,6 @@ AS_IF([test "x$enable_sasl_pwdb" = "xyes"],
 AC_ARG_ENABLE(tls,
   [AS_HELP_STRING([--enable-tls], [Enable Transport Layer Security EXPERIMENTAL ])])
 
-
-AC_ARG_ENABLE(asan,
-  [AS_HELP_STRING([--enable-asan], [Compile with ASAN EXPERIMENTAL ])])
 
 dnl **********************************************************************
 dnl DETECT_SASL_CB_GETCONF
@@ -175,11 +175,12 @@ if test "x$enable_dtrace" = "xyes"; then
   if test "x$DTRACE" != "xno"; then
     AC_DEFINE([ENABLE_DTRACE],1,[Set to nonzero if you want to include DTRACE])
     build_dtrace=yes
-    $DTRACE -h -o conftest.h -s memcached_dtrace.d 2>/dev/zero
+    # DTrace on MacOSX does not use -G option
+    $DTRACE -G -o conftest.$$ -s memcached_dtrace.d 2>/dev/zero
     if test $? -eq 0
     then
         dtrace_instrument_obj=yes
-        rm conftest.h
+        rm conftest.$$
     fi
 
     if test "`which tr`" = "/usr/ucb/tr"; then
@@ -190,8 +191,12 @@ if test "x$enable_dtrace" = "xyes"; then
   fi
 fi
 
-if test "x$enable_extstore" != "xno"; then
+if test "x$enable_extstore" = "xyes"; then
     AC_DEFINE([EXTSTORE],1,[Set to nonzero if you want to enable extstore])
+fi
+
+if test "x$enable_pslab" = "xyes"; then
+    AC_DEFINE([PSLAB],1,[Set to nonzero if you want to enable pslab])
 fi
 
 if test "x$enable_tls" = "xyes"; then
@@ -202,18 +207,13 @@ if test "x$enable_arm_crc32" = "xyes"; then
     AC_DEFINE([ARM_CRC32],1,[Set to nonzero if you want to enable ARMv8 crc32])
 fi
 
-if test "x$enable_asan" = "xyes"; then
-    AC_DEFINE([ASAN],1,[Set to nonzero if you want to compile using ASAN])
-fi
-
 AM_CONDITIONAL([BUILD_DTRACE],[test "$build_dtrace" = "yes"])
 AM_CONDITIONAL([DTRACE_INSTRUMENT_OBJ],[test "$dtrace_instrument_obj" = "yes"])
 AM_CONDITIONAL([ENABLE_SASL],[test "$enable_sasl" = "yes"])
-AM_CONDITIONAL([ENABLE_EXTSTORE],[test "$enable_extstore" != "no"])
+AM_CONDITIONAL([ENABLE_EXTSTORE],[test "$enable_extstore" = "yes"])
 AM_CONDITIONAL([ENABLE_ARM_CRC32],[test "$enable_arm_crc32" = "yes"])
 AM_CONDITIONAL([ENABLE_TLS],[test "$enable_tls" = "yes"])
-AM_CONDITIONAL([ENABLE_ASAN],[test "$enable_asan" = "yes"])
-
+AM_CONDITIONAL([ENABLE_PSLAB],[test "$enable_pslab" = "yes"])
 
 AC_SUBST(DTRACE)
 AC_SUBST(DTRACEFLAGS)
@@ -271,15 +271,9 @@ return sizeof(void*) == 8 ? 0 : 1;
     ],[
       CFLAGS="-m64 $org_cflags"
     ],[
-      AC_MSG_ERROR([Don't know how to build a 64-bit object.])
-    ],[
-       dnl cross compile
-       AC_MSG_WARN([Assuming no extra CFLAGS are required for cross-compiling 64bit version.])
+    AC_MSG_ERROR([Don't know how to build a 64-bit object.])
     ])
 fi
-
-dnl Check if data pointer is 64bit or not
-AC_CHECK_SIZEOF([void *])
 
 # Issue 213: Search for clock_gettime to help people linking
 #            with a static version of libevent
@@ -302,7 +296,7 @@ AC_ARG_WITH(libevent,
 dnl ------------------------------------------------------
 dnl libevent detection.  swiped from Tor.  modified a bit.
 
-LIBEVENT_URL=https://www.monkey.org/~provos/libevent/
+LIBEVENT_URL=http://www.monkey.org/~provos/libevent/
 
 AC_CACHE_CHECK([for libevent directory], ac_cv_libevent_dir, [
   saved_LIBS="$LIBS"
@@ -466,6 +460,7 @@ fi
 
 dnl ----------------------------------------------------------------------------
 
+AC_SEARCH_LIBS(umem_cache_create, umem)
 AC_SEARCH_LIBS(gethugepagesizes, hugetlbfs)
 
 AC_HEADER_STDBOOL
@@ -568,10 +563,30 @@ fi
 AC_C_SOCKLEN_T
 
 dnl Check if we're a little-endian or a big-endian system, needed by hash code
-AC_C_BIGENDIAN(
-  [AC_DEFINE(ENDIAN_BIG, 1, [machine is bigendian])],
-  [AC_DEFINE(ENDIAN_LITTLE, 1, [machine is littleendian])],
-  [AC_MSG_ERROR([Cannot detect endianness. Must pass ac_cv_c_bigendian={yes,no} to configure.])])
+AC_DEFUN([AC_C_ENDIAN],
+[AC_CACHE_CHECK(for endianness, ac_cv_c_endian,
+[
+  AC_RUN_IFELSE(
+    [AC_LANG_PROGRAM([], [dnl
+        long val = 1;
+        char *c = (char *) &val;
+        exit(*c == 1);
+    ])
+  ],[
+    ac_cv_c_endian=big
+  ],[
+    ac_cv_c_endian=little
+  ])
+])
+if test $ac_cv_c_endian = big; then
+  AC_DEFINE(ENDIAN_BIG, 1, [machine is bigendian])
+fi
+if test $ac_cv_c_endian = little; then
+  AC_DEFINE(ENDIAN_LITTLE, 1, [machine is littleendian])
+fi
+])
+
+AC_C_ENDIAN
 
 AC_DEFUN([AC_C_HTONLL],
 [
@@ -605,7 +620,6 @@ fi
 
 AC_CHECK_FUNCS(mlockall)
 AC_CHECK_FUNCS(getpagesizes)
-AC_CHECK_FUNCS(sysconf)
 AC_CHECK_FUNCS(memcntl)
 AC_CHECK_FUNCS(sigignore)
 AC_CHECK_FUNCS(clock_gettime)
@@ -648,15 +662,12 @@ AC_DEFUN([AC_C_ALIGNMENT],
   ],[
     ac_cv_c_alignment=need
   ],[
-    dnl cross compile
-    ac_cv_c_alignment=maybe
+    ac_cv_c_alignment=need
   ])
 ])
-AS_IF([test $ac_cv_c_alignment = need],
-  [AC_DEFINE(NEED_ALIGN, 1, [Machine need alignment])])
-AS_IF([test $ac_cv_c_alignment = maybe],
-  [AC_MSG_WARN([Assuming aligned access is required when cross-compiling])
-   AC_DEFINE(NEED_ALIGN, 1, [Machine need alignment])])
+if test $ac_cv_c_alignment = need; then
+  AC_DEFINE(NEED_ALIGN, 1, [Machine need alignment])
+fi
 ])
 
 AC_C_ALIGNMENT
@@ -722,19 +733,17 @@ AC_CHECK_FUNCS(pledge, [
    ], [])
 ],[])
 
-AC_CHECK_FUNCS(cap_enter, [
-   AC_CHECK_HEADER(sys/capsicum.h, [
-      AC_DEFINE([HAVE_DROP_PRIVILEGES], 1,
-         [Define this if you have an implementation of drop_privileges()])
-      build_freebsd_privs=yes
-   ], [])
-],[])
-
-
 AM_CONDITIONAL([BUILD_SOLARIS_PRIVS],[test "$build_solaris_privs" = "yes"])
 AM_CONDITIONAL([BUILD_LINUX_PRIVS],[test "$build_linux_privs" = "yes"])
 AM_CONDITIONAL([BUILD_OPENBSD_PRIVS],[test "$build_openbsd_privs" = "yes"])
-AM_CONDITIONAL([BUILD_FREEBSD_PRIVS],[test "$build_freebsd_privs" = "yes"])
+
+AC_CHECK_HEADER(umem.h, [
+   AC_DEFINE([HAVE_UMEM_H], 1,
+         [Define this if you have umem.h])
+   build_cache=no
+], [build_cache=yes])
+
+AM_CONDITIONAL([BUILD_CACHE], [test "x$build_cache" = "xyes"])
 
 AC_ARG_ENABLE(docs,
   [AS_HELP_STRING([--disable-docs],[Disable documentation generation])])
@@ -759,9 +768,6 @@ elif test "$GCC" = "yes"
 then
   GCC_VERSION=`$CC -dumpversion`
   CFLAGS="$CFLAGS -Wall -Werror -pedantic -Wmissing-prototypes -Wmissing-declarations -Wredundant-decls"
-  if test "x$enable_asan" = "xyes"; then
-    CFLAGS="$CFLAGS -fsanitize=address"
-  fi
   case $GCC_VERSION in
     4.4.*)
     CFLAGS="$CFLAGS -fno-strict-aliasing"

@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <inttypes.h>
+#include <stdio.h>
 
 #ifndef NDEBUG
 #include <signal.h>
@@ -19,6 +20,7 @@ const int initial_pool_size = 64;
 cache_t* cache_create(const char *name, size_t bufsize, size_t align,
                       cache_constructor_t* constructor,
                       cache_destructor_t* destructor) {
+    //fprintf(stderr, "cache creation \n");
     cache_t* ret = calloc(1, sizeof(cache_t));
     char* nm = strdup(name);
     void** ptr = calloc(initial_pool_size, sizeof(void*));
@@ -43,12 +45,6 @@ cache_t* cache_create(const char *name, size_t bufsize, size_t align,
 #endif
 
     return ret;
-}
-
-void cache_set_limit(cache_t *cache, int limit) {
-    pthread_mutex_lock(&cache->mutex);
-    cache->limit = limit;
-    pthread_mutex_unlock(&cache->mutex);
 }
 
 static inline void* get_object(void *ptr) {
@@ -88,7 +84,7 @@ void* do_cache_alloc(cache_t *cache) {
     if (cache->freecurr > 0) {
         ret = cache->ptr[--cache->freecurr];
         object = get_object(ret);
-    } else if (cache->limit == 0 || cache->total < cache->limit) {
+    } else {
         object = ret = malloc(cache->bufsize);
         if (ret != NULL) {
             object = get_object(ret);
@@ -98,10 +94,7 @@ void* do_cache_alloc(cache_t *cache) {
                 free(ret);
                 object = NULL;
             }
-            cache->total++;
         }
-    } else {
-        object = NULL;
     }
 
 #ifndef NDEBUG
@@ -142,14 +135,7 @@ void do_cache_free(cache_t *cache, void *ptr) {
     }
     ptr = pre;
 #endif
-    if (cache->limit > cache->total) {
-        /* Allow freeing in case the limit was revised downward */
-        if (cache->destructor) {
-            cache->destructor(ptr, NULL);
-        }
-        free(ptr);
-        cache->total--;
-    } else if (cache->freecurr < cache->freetotal) {
+    if (cache->freecurr < cache->freetotal) {
         cache->ptr[cache->freecurr++] = ptr;
     } else {
         /* try to enlarge free connections array */
@@ -164,7 +150,7 @@ void do_cache_free(cache_t *cache, void *ptr) {
                 cache->destructor(ptr, NULL);
             }
             free(ptr);
-            cache->total--;
+
         }
     }
 }

@@ -9,3 +9,6 @@ void stop_assoc_maintenance_thread(void);
 void assoc_start_expand(uint64_t curr_items);
 extern unsigned int hashpower;
 extern unsigned int item_lock_hashpower;
+void assoc_recovery(PMEMoid root, uint64_t old_pool);
+void assoc_expand(void);
+unsigned checksum(void *buffer, size_t len, unsigned int seed);
