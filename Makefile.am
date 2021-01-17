@@ -46,6 +46,12 @@ BUILT_SOURCES += memcached_dtrace.h
 CLEANFILES += memcached_dtrace.h
 endif
 
+if ENABLE_PSLAB
+memcached_LDADD += pmdk/src/nondebug/libpmemobj.a pmdk/src/nondebug/libpmem.a
+memcached_debug_LDADD += pmdk/src/nondebug/libpmemobj.a pmdk/src/nondebug/libpmem.a
+endif
+
+
 if DTRACE_INSTRUMENT_OBJ
 memcached_LDADD += memcached_dtrace.o
 memcached_DEPENDENCIES += memcached_dtrace.o
