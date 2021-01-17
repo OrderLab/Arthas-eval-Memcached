@@ -25,3 +25,4 @@ item *do_item_touch(const char *key, const size_t nkey, uint32_t exptime, const 
 void item_stats_reset(void);
 extern pthread_mutex_t cache_lock;
 void item_stats_evictions(uint64_t *evicted);
+void item_link_fixup(item *it);

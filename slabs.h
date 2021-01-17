@@ -10,7 +10,7 @@
 */
 void slabs_init(const size_t limit, const double factor, const bool prealloc);
 
-
+void slab_recovery(PMEMoid root, uint64_t old_pool);
 /**
  * Given object size, return id to use when allocating/freeing memory for object
  * 0 means error: can't store such a large object

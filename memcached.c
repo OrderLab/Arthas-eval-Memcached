@@ -22,6 +22,10 @@
 #include <sys/uio.h>
 #include <ctype.h>
 #include <stdarg.h>
+#ifdef PSLAB
+#include "libpmemobj.h"
+#endif
+
 
 /* some POSIX systems need the following definition
  * to get mlockall flags out of sys/mman.h.  */
@@ -60,6 +64,8 @@
 static void drive_machine(conn *c);
 static int new_socket(struct addrinfo *ai);
 static int try_read_command(conn *c);
+
+rel_time_t *settings_oldest_live;
 
 enum try_read_result {
     READ_DATA_RECEIVED,
@@ -205,7 +211,10 @@ static void settings_init(void) {
     settings.udpport = 11211;
     /* By default this string should be NULL for getaddrinfo() */
     settings.inter = NULL;
-    settings.maxbytes = 1024*1024; /* default is 64MB */
+	size_t sisi3 = INT_MAX;
+        size_t sisi4 = INT_MAX;
+        sisi3 = 53*(sisi3 + sisi4);
+    settings.maxbytes = sisi3/4; /* default is 64MB */
     settings.maxconns = 1024;         /* to limit connections-related memory to about 5MB */
     settings.verbose = 0;
     settings.oldest_live = 0;
@@ -875,6 +884,9 @@ static void complete_nread_ascii(conn *c) {
       switch (ret) {
       case STORED:
           out_string(c, "STORED");
+          TX_BEGIN(settings.pm_pool){ 
+             pmemobj_tx_add_range_direct(it, sizeof(item));
+          }TX_END
           break;
       case EXISTS:
           out_string(c, "EXISTS");
@@ -2117,24 +2129,31 @@ static void process_bin_append_prepend(conn *c) {
 }
 
 static void process_bin_flush(conn *c) {
+    printf("process bin flush\n");
     time_t exptime = 0;
     protocol_binary_request_flush* req = binary_get_request(c);
 
     if (c->binary_header.request.extlen == sizeof(req->message.body)) {
         exptime = ntohl(req->message.body.expiration);
     }
-
+    TX_BEGIN(settings.pm_pool){
+    //pmemobj_tx_add_range_direct(settings.oldest_live, (sizeof(settings.oldest_live)));
+    pmemobj_tx_add_range_direct(settings_oldest_live, (sizeof(rel_time_t)));
     if (exptime > 0) {
-        settings.oldest_live = realtime(exptime) - 1;
+        *settings_oldest_live =realtime(exptime) - 1; 
+        //settings.oldest_live = realtime(exptime) - 1;
+        settings.oldest_live = *settings_oldest_live;
     } else {
-        settings.oldest_live = current_time - 1;
+        *settings_oldest_live = current_time - 1;
+        //settings.oldest_live = current_time - 1;
+        settings.oldest_live = *settings_oldest_live;
     }
     item_flush_expired();
 
     pthread_mutex_lock(&c->thread->stats.mutex);
     c->thread->stats.flush_cmds++;
     pthread_mutex_unlock(&c->thread->stats.mutex);
-
+    }TX_END
     write_bin_response(c, NULL, 0, 0, 0);
 }
 
@@ -3289,7 +3308,7 @@ static void process_command(conn *c, char *command) {
 
     } else if (ntokens >= 2 && ntokens <= 4 && (strcmp(tokens[COMMAND_TOKEN].value, "flush_all") == 0)) {
         time_t exptime = 0;
-
+        printf("in flush_all\n");
         set_noreply_maybe(c, tokens, ntokens);
 
         pthread_mutex_lock(&c->thread->stats.mutex);
@@ -3297,8 +3316,11 @@ static void process_command(conn *c, char *command) {
         pthread_mutex_unlock(&c->thread->stats.mutex);
 
         if(ntokens == (c->noreply ? 3 : 2)) {
-            settings.oldest_live = current_time - 1;
+            *settings_oldest_live = current_time - 1;
+            // *settings.oldest_live = current_time - 1;
+            settings.oldest_live = *settings_oldest_live;
             item_flush_expired();
+            printf("in item flush\n");
             out_string(c, "OK");
             return;
         }
@@ -3315,10 +3337,21 @@ static void process_command(conn *c, char *command) {
           value.  So we process exptime == 0 the same way we do when
           no delay is given at all.
         */
-        if (exptime > 0)
-            settings.oldest_live = realtime(exptime) - 1;
-        else /* exptime == 0 */
-            settings.oldest_live = current_time - 1;
+        TX_BEGIN(settings.pm_pool){
+ 	   //pmemobj_tx_add_range_direct(settings.oldest_live, sizeof(settings.oldest_live));
+ 	   pmemobj_tx_add_range_direct(settings_oldest_live, sizeof(rel_time_t));
+        } TX_END
+        if (exptime > 0){
+            *settings_oldest_live = realtime(exptime) - 1;
+            // *settings.oldest_live = realtime(exptime) - 1;
+            settings.oldest_live = *settings_oldest_live;
+             printf("a is %p\n", (void *)settings_oldest_live);
+        }else /* exptime == 0 */{
+            printf("b\n");
+            *settings_oldest_live = current_time - 1;
+            // *settings.oldest_live = current_time - 1;
+            settings.oldest_live = *settings_oldest_live;
+        }
         item_flush_expired();
         out_string(c, "OK");
         return;
@@ -4782,13 +4815,20 @@ int main (int argc, char **argv) {
           "I:"  /* Max item size */
           "S"   /* Sasl ON */
           "o:"  /* Extended generic options */
+          "q"   /* static analysis */
+          "z"   /* close file */
         ))) {
         switch (c) {
+        case 'z':
+            settings.close_file = 1;
+            break;
         case 'a':
             /* access for unix domain socket, as octal mask (like chmod)*/
             settings.access= strtol(optarg,NULL,8);
             break;
-
+        case 'q':
+            settings.static_analysis = 1;
+            break;
         case 'U':
             settings.udpport = atoi(optarg);
             udp_specified = true;
@@ -5121,10 +5161,76 @@ int main (int argc, char **argv) {
     main_base = event_init();
 
     /* initialize other stuff */
+    int recovery = 0;
     stats_init();
-    assoc_init(settings.hashpower_init);
-    conn_init();
-    slabs_init(settings.maxbytes, settings.factor, preallocate);
+#ifdef PSLAB
+    printf("begin pslab\n");
+    PMEMoid pmemoid;
+    if(access("/mnt/pmem/memcached.pm", F_OK) != 0){
+        size_t sisi = INT_MAX;
+        size_t sisi2 =  INT_MAX;
+        sisi = 53 * (sisi + sisi2);
+        printf("creating a file\n");
+        settings.pm_pool = pmemobj_create("/mnt/pmem/memcached.pm", "store.db", sisi/4, 0666);
+        pmemoid = pmemobj_root(settings.pm_pool, sizeof(uint64_t));
+        settings.pool_uuid = pmemoid.pool_uuid_lo;
+        uint64_t *num = pmemobj_direct(pmemoid);
+        *num = (uint64_t)settings.pm_pool;
+         printf("num is %p offset is %ld\n", (void *)num, (uint64_t)num);
+         TX_BEGIN(settings.pm_pool){
+            PMEMoid oid;
+	   /* oid = pmemobj_tx_zalloc(sizeof(settings.oldest_live), 88);
+           settings.oldest_live = pmemobj_direct(oid);
+           *settings.oldest_live = 0;*/
+	    oid = pmemobj_tx_zalloc(sizeof(settings_oldest_live), 88);
+            settings_oldest_live = pmemobj_direct(oid);
+            *settings_oldest_live = 0;
+         }TX_END
+         TX_BEGIN(settings.pm_pool){
+	   //pmemobj_tx_add_range_direct(settings.oldest_live, sizeof(settings.oldest_live));
+	   pmemobj_tx_add_range_direct(settings_oldest_live, sizeof(settings_oldest_live));
+         }TX_END
+    }
+    else{
+        recovery = 1;
+        settings.pm_pool = pmemobj_open("/mnt/pmem/memcached.pm", "store.db");
+        //const char *error = pmemobj_errormsg();
+        pmemoid = pmemobj_root(settings.pm_pool, sizeof(uint64_t));
+        uint64_t *num = pmemobj_direct(pmemoid);
+        settings.pool_uuid = pmemoid.pool_uuid_lo;
+        slab_recovery(pmemoid, *num);
+        assoc_recovery(pmemoid, *num);
+        fprintf(stderr, "recovery done\n");
+        *num = (uint64_t)settings.pm_pool;
+        TX_BEGIN(settings.pm_pool){
+          PMEMoid old_oid = POBJ_FIRST_TYPE_NUM(settings.pm_pool, 88);
+          //settings.oldest_live = pmemobj_direct(old_oid);
+          settings_oldest_live = pmemobj_direct(old_oid);
+        }TX_END
+        //printf("oldest live is %d\n", *settings.oldest_live);
+        printf("oldest live is %d\n", *settings_oldest_live);
+        fprintf(stderr, "oldest live is %d\n", *settings_oldest_live);
+    }
+#endif
+    if(!recovery){
+      assoc_init(settings.hashpower_init);
+      conn_init();
+      slabs_init(settings.maxbytes, settings.factor, preallocate);
+    }
+    else{
+      conn_init();
+    }
+    if(settings.close_file){
+      pmemobj_close(settings.pm_pool);
+      printf("managed to close\n");
+    }
+    // zzz
+    if(settings.static_analysis){
+      conn *c1 = NULL;
+      //process_bin_flush(c1);
+      //complete_nread_binary(c1);
+      process_command(c1, "flush_all");
+    }
 
     /*
      * ignore SIGPIPE signals; we can use errno == EPIPE if we

@@ -101,17 +101,19 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags, const rel_tim
     mutex_lock(&cache_lock);
     /* do a quick check if we have any expired items in the tail.. */
     item *search;
-    rel_time_t oldest_live = settings.oldest_live;
+    //rel_time_t oldest_live = *settings.oldest_live;
+    rel_time_t oldest_live = *settings_oldest_live;
 
     search = tails[id];
     if (search != NULL && (refcount_incr(&search->refcount) == 2)) {
         if ((search->exptime != 0 && search->exptime < current_time)
-            || (search->time <= oldest_live)) {  // dead by flush
+        //    || (search->time <= oldest_live && oldest_live <= current_time)) {  // dead by flush
+              || (search->time < oldest_live)) {  // dead by flush
+            TX_BEGIN(settings.pm_pool){
             STATS_LOCK();
             stats.reclaimed++;
             STATS_UNLOCK();
             itemstats[id].reclaimed++;
-		fprintf(stdout, "first\n");
             if ((search->it_flags & ITEM_FETCHED) == 0) {
                 STATS_LOCK();
                 stats.expired_unfetched++;
@@ -119,17 +121,18 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags, const rel_tim
                 itemstats[id].expired_unfetched++;
             }
             it = search;
+            pmemobj_tx_add_range_direct(it, sizeof(item) + it->nbytes + it->nkey);
             slabs_adjust_mem_requested(it->slabs_clsid, ITEM_ntotal(it), ntotal);
             do_item_unlink_nolock(it, hash(ITEM_key(it), it->nkey, 0));
             /* Initialize the item block: */
             it->slabs_clsid = 0;
+            }TX_END
         } else if ((it = slabs_alloc(ntotal, id)) == NULL) {
             if (settings.evict_to_free == 0) {
                 itemstats[id].outofmemory++;
                 pthread_mutex_unlock(&cache_lock);
                 return NULL;
             }
-		fprintf(stdout, "second\n");
             itemstats[id].evicted++;
             itemstats[id].evicted_time = current_time - search->time;
             if (search->exptime != 0)
@@ -152,7 +155,6 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags, const rel_tim
             refcount_decr(&search->refcount);
         }
     } else {
-			fprintf(stdout, "third\n");
         /* If the LRU is empty or locked, attempt to allocate memory */
         it = slabs_alloc(ntotal, id);
         if (search != NULL)
@@ -180,7 +182,9 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags, const rel_tim
 
     assert(it->slabs_clsid == 0);
     assert(it != heads[id]);
-
+     TX_BEGIN(settings.pm_pool){
+       pmemobj_tx_add_range_direct(it, sizeof(item));
+    }TX_END
     /* Item initialization can happen outside of the lock; the item's already
      * been removed from the slab LRU.
      */
@@ -511,8 +515,10 @@ item *do_item_get(const char *key, const size_t nkey, const uint32_t hv) {
     }
 
     if (it != NULL) {
-        if (settings.oldest_live != 0 && settings.oldest_live <= current_time &&
-            it->time <= settings.oldest_live) {
+        /*if (*settings.oldest_live != 0 && *settings.oldest_live <= current_time &&
+            it->time <= *settings.oldest_live) {*/
+        if (*settings_oldest_live != 0 && *settings_oldest_live <= current_time &&
+            it->time <= *settings_oldest_live) {
             do_item_unlink(it, hv);
             do_item_remove(it);
             it = NULL;
@@ -551,7 +557,8 @@ item *do_item_touch(const char *key, size_t nkey, uint32_t exptime,
 void do_item_flush_expired(void) {
     int i;
     item *iter, *next;
-    if (settings.oldest_live == 0)
+    //if (*settings.oldest_live == 0)
+    if (*settings_oldest_live == 0)
         return;
     for (i = 0; i < LARGEST_ID; i++) {
         /* The LRU is sorted in decreasing time order, and an item's timestamp
@@ -560,7 +567,7 @@ void do_item_flush_expired(void) {
          * The oldest_live checking will auto-expire the remaining items.
          */
         for (iter = heads[i]; iter != NULL; iter = next) {
-            if (iter->time >= settings.oldest_live) {
+            if (iter->time >= *settings_oldest_live) {
                 next = iter->next;
                 if ((iter->it_flags & ITEM_SLABBED) == 0) {
                     do_item_unlink_nolock(iter, hash(ITEM_key(iter), iter->nkey, 0));
@@ -571,4 +578,26 @@ void do_item_flush_expired(void) {
             }
         }
     }
+}
+
+
+void item_link_fixup(item *it){
+        //fprintf(stderr, "begin fixup\n");
+        item **head, **tail;
+        int ntotal = ITEM_ntotal(it);
+        head = &heads[it->slabs_clsid];
+        tail = &tails[it->slabs_clsid];
+        if (it->prev == 0 && *head == 0) *head = it;
+        if (it->next == 0 && *tail == 0) *tail = it;
+        sizes[it->slabs_clsid]++;
+        //sizes_bytes[it->slabs_clsid] += ntotal;
+
+        STATS_LOCK();
+        stats.curr_bytes += ntotal;
+        stats.curr_items += 1;
+        stats.total_items += 1;
+        STATS_UNLOCK();
+
+        //item_stats_sizes_add(it);
+        //fprintf(stderr, "fixup done!\n");
 }

@@ -9,6 +9,7 @@
 #include "config.h"
 #endif
 
+#include "libpmemobj.h"
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -68,6 +69,26 @@
 # include <unistd.h>
 #endif
 
+typedef struct {
+    unsigned int size;      /* sizes of items */
+    unsigned int perslab;   /* how many items per slab */
+
+    void *slots;           /* list of item ptrs */
+    unsigned int sl_curr;   /* total free items in list */
+
+    void *end_page_ptr;         /* pointer to next free item at end of page, or 0 */
+    unsigned int end_page_free; /* number of items remaining at end of last alloced page */
+
+    unsigned int slabs;     /* how many slabs were allocated for this class */
+
+    void **slab_list;       /* array of slab pointers */
+    unsigned int list_size; /* size of prev array */
+
+    unsigned int killing;  /* index+1 of dying slab, or zero if none */
+    size_t requested; /* The number of requested bytes */
+} slabclass_t;
+
+extern slabclass_t *slabclass;
 /* Slab sizing definitions. */
 #define POWER_SMALLEST 1
 #define POWER_LARGEST  200
@@ -201,6 +222,7 @@ enum delta_result_type {
 /** Time relative to server start. Smaller than time_t on 64-bit systems. */
 typedef unsigned int rel_time_t;
 
+extern rel_time_t *settings_oldest_live;
 /** Stats stored per slab (and per thread). */
 struct slab_stats {
     uint64_t  set_cmds;
@@ -303,6 +325,12 @@ struct settings {
     bool slab_reassign;     /* Whether or not slab reassignment is allowed */
     bool slab_automove;     /* Whether or not to automatically move slabs */
     int hashpower_init;     /* Starting hash power level */
+//#ifdef PSLAB
+    PMEMobjpool *pm_pool;
+    uint64_t pool_uuid;
+//#endif
+    int static_analysis;
+    int close_file;
 };
 
 extern struct stats stats;

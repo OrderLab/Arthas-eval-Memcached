@@ -40,6 +40,7 @@ static unsigned int hashpower = HASHPOWER_DEFAULT;
 /* Main hash table. This is where we look except during expansion. */
 static item** primary_hashtable = 0;
 
+int *pmem_hashpower = NULL;
 /*
  * Previous hash table. During expansion, we look here for keys that haven't
  * been moved over to the primary yet.
@@ -62,7 +63,20 @@ void assoc_init(const int hashtable_init) {
     if (hashtable_init) {
         hashpower = hashtable_init;
     }
-    primary_hashtable = calloc(hashsize(hashpower), sizeof(void *));
+    TX_BEGIN(settings.pm_pool){
+                PMEMoid oid;
+                oid = pmemobj_tx_zalloc(hashsize(hashpower) * sizeof(void *), 13);
+                primary_hashtable = pmemobj_direct(oid);
+                PMEMoid hashoid;
+                hashoid = pmemobj_tx_zalloc(sizeof(int), 25);
+                pmem_hashpower = pmemobj_direct(hashoid);
+                *pmem_hashpower = hashpower;
+    }TX_ONABORT{
+                fprintf(stderr, "hashtable initial allocation has failed\n");
+    }TX_ONCOMMIT{
+                fprintf(stderr, "hashtable initial allocation has finished!\n");
+    }TX_END
+   // primary_hashtable = calloc(hashsize(hashpower), sizeof(void *));
     if (! primary_hashtable) {
         fprintf(stderr, "Failed to init hashtable.\n");
         exit(EXIT_FAILURE);
@@ -123,12 +137,16 @@ static item** _hashitem_before (const char *key, const size_t nkey, const uint32
 /* grows the hashtable to the next power of 2. */
 static void assoc_expand(void) {
     old_hashtable = primary_hashtable;
-
-    primary_hashtable = calloc(hashsize(hashpower + 1), sizeof(void *));
+    TX_BEGIN(settings.pm_pool){
+                PMEMoid oid;
+                oid = pmemobj_tx_zalloc(hashsize(hashpower + 1) * sizeof(void *), 13);
+                primary_hashtable = pmemobj_direct(oid);
+    //primary_hashtable = calloc(hashsize(hashpower + 1), sizeof(void *));
     if (primary_hashtable) {
         if (settings.verbose > 1)
             fprintf(stderr, "Hash table expansion starting\n");
         hashpower++;
+        *pmem_hashpower = hashpower;
         expanding = true;
         expand_bucket = 0;
         STATS_LOCK();
@@ -141,6 +159,11 @@ static void assoc_expand(void) {
         primary_hashtable = old_hashtable;
         /* Bad news, but we can keep running. */
     }
+    }TX_ONABORT{
+                fprintf(stderr, "hashtable expansion has failed\n");
+    }TX_ONCOMMIT{
+                fprintf(stderr, "hashtable expansion has finished!\n");
+    }TX_END
 }
 
 /* Note: this isn't an assoc_update.  The key must not already exist to call this */
@@ -220,7 +243,16 @@ static void *assoc_maintenance_thread(void *arg) {
             expand_bucket++;
             if (expand_bucket == hashsize(hashpower - 1)) {
                 expanding = false;
-                free(old_hashtable);
+                //free(old_hashtable);
+                 TX_BEGIN(settings.pm_pool){
+                                PMEMoid oid;
+                                oid = pmemobj_oid(old_hashtable);
+                                pmemobj_tx_free(oid);
+                 }TX_ONABORT{
+                                fprintf(stderr, "old_hashtable freeing has failed");
+                 }TX_ONCOMMIT{
+                                fprintf(stderr, "old_hashtable freed\n");
+                 }TX_END
                 STATS_LOCK();
                 stats.hash_bytes -= hashsize(hashpower - 1) * sizeof(void *);
                 stats.hash_is_expanding = 0;
@@ -269,4 +301,25 @@ void stop_assoc_maintenance_thread() {
     pthread_join(maintenance_tid, NULL);
 }
 
+
+void assoc_recovery(PMEMoid root, uint64_t old_pool){
+
+        TX_BEGIN(settings.pm_pool){
+                PMEMoid poweroid = POBJ_FIRST_TYPE_NUM(settings.pm_pool, 25);
+                pmem_hashpower = pmemobj_direct(poweroid);
+                hashpower= *pmem_hashpower;
+                int num_of_slots = hashsize(hashpower);
+                PMEMoid primary_oid = POBJ_FIRST_TYPE_NUM(settings.pm_pool, 13);
+                primary_hashtable = pmemobj_direct(primary_oid);
+                for(int i = 0; i < num_of_slots; i++){
+                        if(primary_hashtable[i]){
+                                primary_hashtable[i] = (item *)((uint64_t)primary_hashtable[i] - old_pool + (uint64_t)settings.pm_pool );
+                        }
+                }
+        }TX_ONABORT{
+                fprintf(stderr, "hashtable recovery has failed\n");
+        } TX_ONCOMMIT{
+                fprintf(stderr,"hastable recovery finished!\n");
+        }TX_END
+}
 

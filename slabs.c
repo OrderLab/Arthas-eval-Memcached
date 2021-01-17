@@ -23,32 +23,14 @@
 
 /* powers-of-N allocation structures */
 
-typedef struct {
-    unsigned int size;      /* sizes of items */
-    unsigned int perslab;   /* how many items per slab */
-
-    void *slots;           /* list of item ptrs */
-    unsigned int sl_curr;   /* total free items in list */
-
-    void *end_page_ptr;         /* pointer to next free item at end of page, or 0 */
-    unsigned int end_page_free; /* number of items remaining at end of last alloced page */
-
-    unsigned int slabs;     /* how many slabs were allocated for this class */
-
-    void **slab_list;       /* array of slab pointers */
-    unsigned int list_size; /* size of prev array */
-
-    unsigned int killing;  /* index+1 of dying slab, or zero if none */
-    size_t requested; /* The number of requested bytes */
-} slabclass_t;
-
-static slabclass_t slabclass[MAX_NUMBER_OF_SLAB_CLASSES];
+slabclass_t *slabclass;
 static size_t mem_limit = 0;
 static size_t mem_malloced = 0;
 static int power_largest;
 
 static void *mem_base = NULL;
 static void *mem_current = NULL;
+void *pmem_current;
 static size_t mem_avail = 0;
 
 /**
@@ -85,9 +67,10 @@ unsigned int slabs_clsid(const size_t size) {
 
     if (size == 0)
         return 0;
-    while (size > slabclass[res].size)
+    while (size > slabclass[res].size){
         if (res++ == power_largest)     /* won't fit in the biggest slab */
             return 0;
+     }
     return res;
 }
 
@@ -98,14 +81,29 @@ unsigned int slabs_clsid(const size_t size) {
 void slabs_init(const size_t limit, const double factor, const bool prealloc) {
     int i = POWER_SMALLEST - 1;
     unsigned int size = sizeof(item) + settings.chunk_size;
-
+     TX_BEGIN(settings.pm_pool){
+        PMEMoid oid;
+        oid = pmemobj_tx_zalloc(sizeof(slabclass_t) * MAX_NUMBER_OF_SLAB_CLASSES, 10);
+        slabclass = pmemobj_direct(oid);
+        pmemobj_tx_add_range_direct(slabclass,sizeof(slabclass_t) * MAX_NUMBER_OF_SLAB_CLASSES );
+        printf("address of slabclass is %p, offset is %ld, size is %ld\n",
+        (void *)slabclass, (uint64_t)slabclass, sizeof(slabclass_t) * MAX_NUMBER_OF_SLAB_CLASSES);
     mem_limit = limit;
-
+    PMEMoid curr = pmemobj_tx_zalloc(sizeof(void *), 20);
+    pmem_current = pmemobj_direct(curr);
+    printf("pmem_current is %p offset is %ld, size is %ld\n", pmem_current, (uint64_t)pmem_current,
+    sizeof(void *));
     if (prealloc) {
         /* Allocate everything in a big chunk with malloc */
-        mem_base = malloc(mem_limit);
+        //mem_base = malloc(mem_limit);
+        PMEMoid oid2;
+        oid2 = pmemobj_tx_zalloc(mem_limit, 12);
+        mem_base = pmemobj_direct(oid2);
+        printf("mem_base is %p offset is %ld, size is %ld\n", mem_base, (uint64_t)mem_base,
+        mem_limit);
         if (mem_base != NULL) {
             mem_current = mem_base;
+            pmem_current = mem_current;
             mem_avail = mem_limit;
         } else {
             fprintf(stderr, "Warning: Failed to allocate requested memory in"
@@ -113,7 +111,7 @@ void slabs_init(const size_t limit, const double factor, const bool prealloc) {
         }
     }
 
-    memset(slabclass, 0, sizeof(slabclass));
+    memset(slabclass, 0, sizeof(slabclass) * MAX_NUMBER_OF_SLAB_CLASSES);
 
     while (++i < POWER_LARGEST && size <= settings.item_size_max / factor) {
         /* Make sure items are always n-byte aligned */
@@ -155,6 +153,11 @@ void slabs_init(const size_t limit, const double factor, const bool prealloc) {
         }
     }
 #endif
+    }TX_ONABORT{
+        fprintf(stderr, "slab init has failed\n");
+    }TX_ONCOMMIT{
+        fprintf(stderr, "slab init has finished!\n");
+    }TX_END
 }
 
 #ifndef DONT_PREALLOC_SLABS
@@ -181,7 +184,17 @@ static int grow_slab_list (const unsigned int id) {
     slabclass_t *p = &slabclass[id];
     if (p->slabs == p->list_size) {
         size_t new_size =  (p->list_size != 0) ? p->list_size * 2 : 16;
-        void *new_list = realloc(p->slab_list, new_size * sizeof(void *));
+        void *new_list = NULL;
+        TX_BEGIN(settings.pm_pool){
+                PMEMoid oid;
+                oid = pmemobj_oid(p->slab_list);
+                oid = pmemobj_tx_realloc(oid, new_size * sizeof(void *), 1);
+                new_list = pmemobj_direct(oid);
+        }TX_ONABORT{
+                fprintf(stderr, "big chunk allocation has failed\n");
+        }TX_ONCOMMIT{
+                //fprintf(stderr, "big chunk allocation has finished!\n");
+        }TX_END
         if (new_list == 0) return 0;
         p->list_size = new_size;
         p->slab_list = new_list;
@@ -189,7 +202,20 @@ static int grow_slab_list (const unsigned int id) {
     return 1;
 }
 
+/*static int grow_slab_list (const unsigned int id) {
+    slabclass_t *p = &slabclass[id];
+    if (p->slabs == p->list_size) {
+        size_t new_size =  (p->list_size != 0) ? p->list_size * 2 : 16;
+        void *new_list = realloc(p->slab_list, new_size * sizeof(void *));
+        if (new_list == 0) return 0;
+        p->list_size = new_size;
+        p->slab_list = new_list;
+    }
+    return 1;
+}*/
+
 static int do_slabs_newslab(const unsigned int id) {
+    TX_BEGIN(settings.pm_pool){
     slabclass_t *p = &slabclass[id];
     int len = settings.slab_reassign ? settings.item_size_max
         : p->size * p->perslab;
@@ -210,7 +236,11 @@ static int do_slabs_newslab(const unsigned int id) {
     p->slab_list[p->slabs++] = ptr;
     mem_malloced += len;
     MEMCACHED_SLABS_SLABCLASS_ALLOCATE(id);
-
+    }TX_ONABORT{
+        fprintf(stderr, "slab newslab has failed\n");
+    }TX_ONCOMMIT{
+        //fprintf();
+    }TX_END
     return 1;
 }
 
@@ -219,7 +249,7 @@ static void *do_slabs_alloc(const size_t size, unsigned int id) {
     slabclass_t *p;
     void *ret = NULL;
     item *it = NULL;
-
+    TX_BEGIN(settings.pm_pool){
     if (id < POWER_SMALLEST || id > power_largest) {
         MEMCACHED_SLABS_ALLOCATE_FAILED(size, 0);
         return NULL;
@@ -269,14 +299,14 @@ static void *do_slabs_alloc(const size_t size, unsigned int id) {
     } else {
         MEMCACHED_SLABS_ALLOCATE_FAILED(size, id);
     }
-
+    }TX_END
     return ret;
 }
 
 static void do_slabs_free(void *ptr, const size_t size, unsigned int id) {
     slabclass_t *p;
     item *it;
-
+ TX_BEGIN(settings.pm_pool){
     assert(((item *)ptr)->slabs_clsid == 0);
     assert(id >= POWER_SMALLEST && id <= power_largest);
     if (id < POWER_SMALLEST || id > power_largest)
@@ -300,6 +330,9 @@ static void do_slabs_free(void *ptr, const size_t size, unsigned int id) {
 
     p->sl_curr++;
     p->requested -= size;
+    }TX_ONABORT {
+      printf("abortion in slabs free %s\n", pmemobj_errormsg());
+    }TX_END
     return;
 }
 
@@ -397,10 +430,15 @@ static void do_slabs_stats(ADD_STAT add_stats, void *c) {
 
 static void *memory_allocate(size_t size) {
     void *ret;
-
+    TX_BEGIN(settings.pm_pool){
     if (mem_base == NULL) {
         /* We are not using a preallocated large memory chunk */
-        ret = malloc(size);
+	PMEMoid oid;
+        oid = pmemobj_tx_zalloc(size , 1);
+        ret = pmemobj_direct(oid);
+        printf("ret of slab memory allocate is %p offset is %ld, size is %ld\n",
+        ret, (uint64_t)ret, size);
+        //ret = malloc(size);
     } else {
         ret = mem_current;
 
@@ -414,12 +452,18 @@ static void *memory_allocate(size_t size) {
         }
 
         mem_current = ((char*)mem_current) + size;
+        pmem_current = mem_current;
         if (size < mem_avail) {
             mem_avail -= size;
         } else {
             mem_avail = 0;
         }
     }
+     }TX_ONABORT{
+                fprintf(stderr, "small chunk allocation has failed\n");
+        }TX_ONCOMMIT{
+                //fprintf(stderr, "small chunk allocation has finished!\n");
+        }TX_END
 
     return ret;
 }
@@ -827,4 +871,62 @@ void stop_slab_maintenance_thread(void) {
 
     /* Wait for the maintenance thread to stop */
     pthread_join(maintenance_tid, NULL);
+}
+
+void slab_recovery(PMEMoid root, uint64_t old_pool){
+        slabclass_t * temp;
+
+        TX_BEGIN(settings.pm_pool){
+                PMEMoid slabclass_oid = POBJ_FIRST_TYPE_NUM(settings.pm_pool, 10);
+                temp = pmemobj_direct(slabclass_oid);
+                item *temp_item = NULL;
+                uint64_t checked = 0;
+                for(int i = 0; i < MAX_NUMBER_OF_SLAB_CLASSES; i++){
+                        //fprintf(stderr, "%d %d %d\n", temp[i].slabs, i, temp[i].size);
+                        if(temp[i].size != 0){
+                                power_largest = i;
+                        }
+                        if(temp[i].slabs > 0){
+                                temp[i].slab_list = (void *)((uint64_t)temp[i].slab_list - old_pool + (uint64_t)settings.pm_pool);
+                                //fprintf(stderr, "slab list has been done %d %d\n", temp[i].sl_curr, temp[i].perslab);
+                                for(int slab_no = 0; slab_no < temp[i].slabs; slab_no++){
+                                        temp[i].slab_list[slab_no] = (void *)((uint64_t)temp[i].slab_list[slab_no] - old_pool + (uint64_t)settings.pm_pool);
+                                        checked = (uint64_t)temp[i].slab_list[slab_no];
+                                        for(int x = 0; x < temp[i].perslab; x++){
+                                                //fprintf(stderr, "validated slab list %d %d\n", x, temp[i].size);
+                                                temp_item= (item *)checked;
+                                                if (temp_item->next){
+                                                        temp_item->next = (item *)((uint64_t)temp_item->next - old_pool + (uint64_t)settings.pm_pool);
+                                                }
+                                                if(temp_item->prev){
+                                                        temp_item->prev = (item *)((uint64_t)temp_item->prev - old_pool + (uint64_t)settings.pm_pool);
+                                                }
+                                                if(temp_item->h_next){
+                                                        //printf("item ref is %hu\n", temp_item->refcount);
+                                                       temp_item->h_next = (item *)((uint64_t)temp_item->h_next - old_pool + (uint64_t)settings.pm_pool);
+                                                        //printf("temp_item->h_next is %p\n", (void *)temp_item->h_next);
+                                                        //temp_item->h_next = NULL;
+                                                }
+                                                if(temp_item->it_flags & ITEM_LINKED){
+                                                        item_link_fixup(temp_item);
+                                                }
+						//if(temp_item->nbytes > 0)
+						//	printf("item is %d %s\n", temp_item->nbytes, ITEM_data(temp_item));
+                                                //fprintf(stderr, "%lu size of item is %d\n", (uint64_t)temp_item - (uint64_t)settings.p$
+                                                checked += temp[i].size;
+                                        }
+                                }
+                        }
+                }
+                mem_limit = settings.maxbytes;
+                PMEMoid curr_oid = POBJ_FIRST_TYPE_NUM(settings.pm_pool, 20);
+                pmem_current = pmemobj_direct(curr_oid);
+                slabclass = temp;
+        }TX_ONABORT{
+                fprintf(stderr, "Recovery has failed\n");
+        }TX_ONCOMMIT{
+                fprintf(stderr, "finished recovery\n");
+        }TX_END
+
+
 }
