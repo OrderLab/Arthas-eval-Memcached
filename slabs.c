@@ -1429,9 +1429,9 @@ void slab_recovery(PMEMoid root, uint64_t old_pool){
 							temp_item->prev = (item *)((uint64_t)temp_item->prev - old_pool + (uint64_t)settings.pm_pool);
 						}
 						if(temp_item->h_next){
-							printf("item ref is %hu\n", temp_item->refcount);
+							//printf("item ref is %hu\n", temp_item->refcount);
 							temp_item->h_next = (item *)((uint64_t)temp_item->h_next - old_pool + (uint64_t)settings.pm_pool);
-							printf("temp_item->h_next is %p\n", (void *)temp_item->h_next);
+							//printf("temp_item->h_next is %p\n", (void *)temp_item->h_next);
 							//temp_item->h_next = NULL;
 						}
 						if(temp_item->it_flags & ITEM_LINKED){
