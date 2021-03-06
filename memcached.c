@@ -272,7 +272,7 @@ static void settings_init(void) {
     settings.inter = NULL;
 	size_t sisi3 = INT_MAX;
 	size_t sisi4 = INT_MAX;
-	sisi3 = 53*(sisi3 + sisi4);
+	sisi3 = (53*(sisi3 + sisi4))/4;
     settings.maxbytes = sisi3 ; /* default is 64MB */
     settings.maxconns = 1024;         /* to limit connections-related memory to about 5MB */
     settings.verbose = 0;
@@ -8086,7 +8086,7 @@ int main (int argc, char **argv) {
 	size_t sisi = INT_MAX;
 	size_t sisi2 =  INT_MAX;
 	sisi = 53 * (sisi + sisi2);
-        settings.pm_pool = pmemobj_create("/mnt/pmem/memcached.pm", "store.db", sisi, 0666);
+        settings.pm_pool = pmemobj_create("/mnt/pmem/memcached.pm", "store.db", sisi/4, 0666);
         pmemoid = pmemobj_root(settings.pm_pool, sizeof(uint64_t));
         settings.pool_uuid = pmemoid.pool_uuid_lo;
         uint64_t *num = pmemobj_direct(pmemoid);
