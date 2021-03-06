@@ -185,21 +185,21 @@ int assoc_insert(item *it, const uint32_t hv) {
     {
 	//pmemobj_tx_add_range_direct(old_hashtable[oldbucket], sizeof(old_hashtable[oldbucket]));
         pmemobj_tx_add_range_direct(it, sizeof(item));
-        printf("it is %p offset %ld %hu it->h_next is %p size is %ld\n", (void *)it, (uint64_t)it,
-        it->refcount, (void *)it->h_next, sizeof(item));
-        printf("offset is %ld\n", (uint64_t)it - (uint64_t)settings.pm_pool  );
+        //printf("it is %p offset %ld %hu it->h_next is %p size is %ld\n", (void *)it, (uint64_t)it,
+        //it->refcount, (void *)it->h_next, sizeof(item));
+        //printf("offset is %ld\n", (uint64_t)it - (uint64_t)settings.pm_pool  );
         it->h_next = old_hashtable[oldbucket];
         old_hashtable[oldbucket] = it;
-        printf("it->h_next is %p\n", (void *)it->h_next);
+        //printf("it->h_next is %p\n", (void *)it->h_next);
     } else {
 	//pmemobj_tx_add_range_direct(primary_hashtable[hv & hashmask(hashpower)], sizeof(primary_hashtable[hv & hashmask(hashpower)]));
         pmemobj_tx_add_range_direct(it, sizeof(item));
-        printf("it is %p offset %ld %hu it->h_next is %p sz is %ld\n", (void *)it, (uint64_t)it,
-	 it->refcount, (void *)it->h_next, sizeof(item));
-        printf("offset is %ld\n", (uint64_t)it - (uint64_t)settings.pm_pool  );
+        //printf("it is %p offset %ld %hu it->h_next is %p sz is %ld\n", (void *)it, (uint64_t)it,
+	//it->refcount, (void *)it->h_next, sizeof(item));
+        //printf("offset is %ld\n", (uint64_t)it - (uint64_t)settings.pm_pool  );
         it->h_next = primary_hashtable[hv & hashmask(hashpower)];
         primary_hashtable[hv & hashmask(hashpower)] = it;
-        printf("it->h_next is %p\n", (void *)it->h_next);
+        //printf("it->h_next is %p\n", (void *)it->h_next);
     }
 
     MEMCACHED_ASSOC_INSERT(ITEM_key(it), it->nkey);
