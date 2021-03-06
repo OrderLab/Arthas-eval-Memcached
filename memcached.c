@@ -7161,6 +7161,9 @@ int main (int argc, char **argv) {
             settings.udpport = atoi(optarg);
             udp_specified = true;
             break;
+       case 'q':
+            settings.static_analysis = 1;
+            break;
         case 'p':
             settings.port = atoi(optarg);
             tcp_specified = true;
@@ -8121,6 +8124,14 @@ int main (int argc, char **argv) {
     	//slabs_init(settings.maxbytes, settings.factor, preallocate,
         //    use_slab_sizes ? slab_sizes : NULL);
 
+    }
+    if(settings.static_analysis){
+      //assoc functions
+      assoc_find("key", 3, 0);
+      /*assoc_start_expand(0);
+      assoc_insert(it, 0);
+      assoc_delete("key", 3, 0);
+      start_assoc_maintenance_thread();*/
     }
 #ifdef EXTSTORE
     if (storage_file) {
