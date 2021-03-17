@@ -183,7 +183,7 @@ static size_t item_make_header(const uint8_t nkey, const unsigned int flags, con
 item *do_item_alloc_pull(const size_t ntotal, const unsigned int id) {
     item *it = NULL;
     int i;
-    TX_BEGIN(settings.pm_pool){
+    //TX_BEGIN(settings.pm_pool){
     /* If no memory is available, attempt a direct LRU juggle/eviction */
     /* This is a race in order to simplify lru_pull_tail; in cases where
      * locked items are on the tail, you want them to fall out and cause
@@ -219,7 +219,7 @@ item *do_item_alloc_pull(const size_t ntotal, const unsigned int id) {
         itemstats[id].direct_reclaims += i;
         pthread_mutex_unlock(&lru_locks[id]);
     }
-    }TX_END
+    //}TX_END
     return it;
 }
 
@@ -262,7 +262,7 @@ item *do_item_alloc(char *key, const size_t nkey, const unsigned int flags,
     // Avoid potential underflows.
     if (nbytes < 2)
         return 0;
-  TX_BEGIN(settings.pm_pool){
+  //TX_BEGIN(settings.pm_pool){
     size_t ntotal = item_make_header(nkey + 1, flags, nbytes, suffix, &nsuffix);
     if (settings.use_cas) {
         ntotal += sizeof(uint64_t);
@@ -352,7 +352,8 @@ unsigned int id = slabs_clsid(ntotal);
         chunk->orig_clsid = hdr_id;
     }
     it->h_next = 0;
-    }TX_END
+    //it->checksum_item = checksum(it, sizeof(it), 0);
+    //}TX_END
     return it;
 }
 
@@ -392,7 +393,7 @@ bool item_size_ok(const size_t nkey, const int flags, const int nbytes) {
 static void do_item_link_q(item *it) { /* item is the new head */
     item **head, **tail;
     assert((it->it_flags & ITEM_SLABBED) == 0);
-    TX_BEGIN(settings.pm_pool){
+    //TX_BEGIN(settings.pm_pool){
     head = &heads[it->slabs_clsid];
     tail = &tails[it->slabs_clsid];
     assert(it != *head);
@@ -412,7 +413,8 @@ static void do_item_link_q(item *it) { /* item is the new head */
 #else
     sizes_bytes[it->slabs_clsid] += ITEM_ntotal(it);
 #endif
-    }TX_END
+    //}TX_END
+    //it->checksum_item = checksum(it, sizeof(it), 0);
     return;
 }
 
@@ -431,7 +433,7 @@ static void item_link_q_warm(item *it) {
 
 static void do_item_unlink_q(item *it) {
     item **head, **tail;
-    TX_BEGIN(settings.pm_pool){
+    //TX_BEGIN(settings.pm_pool){
     head = &heads[it->slabs_clsid];
     tail = &tails[it->slabs_clsid];
 
@@ -458,7 +460,8 @@ static void do_item_unlink_q(item *it) {
 #else
     sizes_bytes[it->slabs_clsid] -= ITEM_ntotal(it);
 #endif
-    }TX_END
+    //}TX_END
+    //it->checksum_item = checksum(it, sizeof(it), 0);
     return;
 }
 
@@ -469,7 +472,7 @@ static void item_unlink_q(item *it) {
 }
 
 int do_item_link(item *it, const uint32_t hv) {
-    TX_BEGIN(settings.pm_pool){
+    //TX_BEGIN(settings.pm_pool){
     MEMCACHED_ITEM_LINK(ITEM_key(it), it->nkey, it->nbytes);
     assert((it->it_flags & (ITEM_LINKED|ITEM_SLABBED)) == 0);
     it->it_flags |= ITEM_LINKED;
@@ -487,12 +490,13 @@ int do_item_link(item *it, const uint32_t hv) {
     item_link_q(it);
     refcount_incr(it);
     item_stats_sizes_add(it);
-    }TX_END
+    //it->checksum_item = checksum(it, sizeof(it), 0);
+    //}TX_END
     return 1;
 }
 
 void do_item_unlink(item *it, const uint32_t hv) {
-     TX_BEGIN(settings.pm_pool){
+//TX_BEGIN(settings.pm_pool){
     MEMCACHED_ITEM_UNLINK(ITEM_key(it), it->nkey, it->nbytes);
     if ((it->it_flags & ITEM_LINKED) != 0) {
         it->it_flags &= ~ITEM_LINKED;
@@ -505,12 +509,12 @@ void do_item_unlink(item *it, const uint32_t hv) {
         item_unlink_q(it);
         do_item_remove(it);
     }
-}TX_END
+//}TX_END
 }
 
 /* FIXME: Is it necessary to keep this copy/pasted code? */
 void do_item_unlink_nolock(item *it, const uint32_t hv) {
-     TX_BEGIN(settings.pm_pool){
+     //TX_BEGIN(settings.pm_pool){
     MEMCACHED_ITEM_UNLINK(ITEM_key(it), it->nkey, it->nbytes);
     if ((it->it_flags & ITEM_LINKED) != 0) {
         it->it_flags &= ~ITEM_LINKED;
@@ -523,7 +527,7 @@ void do_item_unlink_nolock(item *it, const uint32_t hv) {
         do_item_unlink_q(it);
         do_item_remove(it);
     }
-}TX_END
+//}TX_END
 }
 
 void do_item_remove(item *it) {
@@ -958,7 +962,7 @@ void item_stats_sizes(ADD_STAT add_stats, void *c) {
 /** wrapper around assoc_find which does the lazy expiration logic */
 item *do_item_get(const char *key, const size_t nkey, const uint32_t hv, conn *c, const bool do_update) {
     item *it = assoc_find(key, nkey, hv);
-    TX_BEGIN(settings.pm_pool){
+    //TX_BEGIN(settings.pm_pool){
     if (it != NULL) {
         refcount_incr(it);
         //pmemobj_tx_add_range_direct(&it->refcount, sizeof(it->refcount));
@@ -1060,7 +1064,7 @@ item *do_item_get(const char *key, const size_t nkey, const uint32_t hv, conn *c
     /* For now this is in addition to the above verbose logging. */
     LOGGER_LOG(c->thread->l, LOG_FETCHERS, LOGGER_ITEM_GET, NULL, was_found, key, nkey,
                (it) ? ITEM_clsid(it) : 0);
-    }TX_END
+    //}TX_END
     return it;
 }
 

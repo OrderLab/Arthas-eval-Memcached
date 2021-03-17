@@ -107,6 +107,7 @@ item *assoc_find(const char *key, const size_t nkey, const uint32_t hv) {
         it = it->h_next;
         ++depth;
     }
+
     MEMCACHED_ASSOC_FIND(key, nkey, depth);
     return ret;
 }
@@ -143,7 +144,9 @@ static void assoc_expand(void) {
         if (settings.verbose > 1)
             fprintf(stderr, "Hash table expansion starting\n");
         hashpower++;
+        pmemobj_tx_add_range_direct(pmem_hashpower, sizeof(int));
 	*pmem_hashpower = hashpower;
+        //expanding = false;
         expanding = true;
         expand_bucket = 0;
         STATS_LOCK();
@@ -195,7 +198,7 @@ int assoc_insert(item *it, const uint32_t hv) {
 	//pmemobj_tx_add_range_direct(primary_hashtable[hv & hashmask(hashpower)], sizeof(primary_hashtable[hv & hashmask(hashpower)]));
         pmemobj_tx_add_range_direct(it, sizeof(item));
         //printf("it is %p offset %ld %hu it->h_next is %p sz is %ld\n", (void *)it, (uint64_t)it,
-	//it->refcount, (void *)it->h_next, sizeof(item));
+	// it->refcount, (void *)it->h_next, sizeof(item));
         //printf("offset is %ld\n", (uint64_t)it - (uint64_t)settings.pm_pool  );
         it->h_next = primary_hashtable[hv & hashmask(hashpower)];
         primary_hashtable[hv & hashmask(hashpower)] = it;

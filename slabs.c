@@ -151,7 +151,7 @@ void slabs_init(const size_t limit, const double factor, const bool prealloc, co
 	PMEMoid oid;
 	oid = pmemobj_tx_zalloc(sizeof(slabclass_t) * MAX_NUMBER_OF_SLAB_CLASSES, 10);
 	slabclass = pmemobj_direct(oid);
-	//pmemobj_tx_add_range_direct(slabclass,sizeof(slabclass_t) * MAX_NUMBER_OF_SLAB_CLASSES );
+	pmemobj_tx_add_range_direct(slabclass,sizeof(slabclass_t) * MAX_NUMBER_OF_SLAB_CLASSES );
 	printf("address of slabclass is %p, offset is %ld, size is %ld\n", 
         (void *)slabclass, (uint64_t)slabclass, sizeof(slabclass_t) * MAX_NUMBER_OF_SLAB_CLASSES);
     /* Some platforms use runtime transparent hugepages. If for any reason
@@ -388,12 +388,14 @@ static void *do_slabs_alloc(const size_t size, unsigned int id, uint64_t *total_
     if (p->sl_curr != 0) {
         /* return off our freelist */
         it = (item *)p->slots;
+        pmemobj_tx_add_range_direct(&p->slots, sizeof(void *) );
         p->slots = it->next;
         if (it->next) it->next->prev = 0;
         /* Kill flag and initialize refcount here for lock safety in slab
          * mover's freeness detection. */
         it->it_flags &= ~ITEM_SLABBED;
         it->refcount = 1;
+        pmemobj_tx_add_range_direct(&p->sl_curr, sizeof(unsigned int));
         p->sl_curr--;
         ret = (void *)it;
     } else {
@@ -654,8 +656,8 @@ static void *memory_allocate(size_t size) {
                 PMEMoid oid;
                 oid = pmemobj_tx_zalloc(size , 1);
                 ret = pmemobj_direct(oid);
-                printf("ret of slab memory allocate is %p offset is %ld, size is %ld\n", 
-                ret, (uint64_t)ret, size);
+                //printf("ret of slab memory allocate is %p offset is %ld, size is %ld\n", 
+                //ret, (uint64_t)ret, size);
     } else {
         ret = mem_current;
 

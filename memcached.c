@@ -188,6 +188,7 @@ static enum transmit_result transmit(conn *c);
  */
 static volatile bool allow_new_conns = true;
 static struct event maxconnsevent;
+
 static void maxconns_handler(const int fd, const short which, void *arg) {
     struct timeval t = {.tv_sec = 0, .tv_usec = 10000};
 
@@ -272,8 +273,8 @@ static void settings_init(void) {
     settings.inter = NULL;
 	size_t sisi3 = INT_MAX;
 	size_t sisi4 = INT_MAX;
-	sisi3 = (53*(sisi3 + sisi4))/4;
-    settings.maxbytes = sisi3 ; /* default is 64MB */
+	sisi3 = 53*(sisi3 + sisi4);
+    settings.maxbytes = sisi3/4 ; /* default is 64MB */
     settings.maxconns = 1024;         /* to limit connections-related memory to about 5MB */
     settings.verbose = 0;
     settings.oldest_live = 0;
@@ -282,7 +283,7 @@ static void settings_init(void) {
     settings.socketpath = NULL;       /* by default, not using a unix socket */
     settings.factor = 1.25;
     settings.chunk_size = 48;         /* space for a modest key and value */
-    settings.num_threads = 16;         /* N workers */
+    settings.num_threads = 4;         /* N workers */
     settings.num_threads_per_udp = 0;
     settings.prefix_delimiter = ':';
     settings.detail_enabled = 0;
@@ -1321,42 +1322,50 @@ static void complete_nread_ascii(conn *c) {
       case STORED:
           out_string(c, "STORED");
 	  //end of set
-          /*TX_BEGIN(settings.pm_pool){
-            pmemobj_tx_add_range_direct(it, sizeof(it));
-            pmemobj_tx_add_range_direct(ITEM_data(it), it->nbytes);
-            pmemobj_tx_add_range_direct(ITEM_key(it), it->nkey);
+          TX_BEGIN(settings.pm_pool){
+            pmemobj_tx_add_range_direct(it, sizeof(item));
+            //pmemobj_tx_add_range_direct(ITEM_data(it), it->nbytes);
+            //pmemobj_tx_add_range_direct(ITEM_key(it), it->nkey);
           }TX_ONABORT{
             printf("abortion in insertion: %s\n", pmemobj_errormsg());
-          }TX_END*/
-	  //clock_t end = clock();
-	  //double time_here = (double)(end-start)/CLOCKS_PER_SEC;
-	  //set_count++;
-	 //times_count++;
+          }TX_END
+	  clock_t end = clock();
+	 //double time_here = (double)(end-start)/CLOCKS_PER_SEC;
 	/*latency_times[set_count - 1] = time_here;
-	 if(set_count == 9900000){
+	 if(set_count == 999999){
+			double total = 0;
 			fprintf(stderr, "BEGIN\n");
-                        for(int ind = 0; ind < 9900000; ind++){
+			int ind;
+                        for(ind = 0; ind < 990000; ind++){
+				total += latency_times[ind]*1000000;
                                 fprintf(out_file, "%f\n", latency_times[ind] * 1000000);
                         }
 			fclose(out_file);
+			printf("total is %f\n", total/ind);
 			fprintf(stderr, "END\n");
                 }*/
           //fprintf(stderr, "%f\n", time_here);
-	  /*if(set_count % 100 == 0){
+	  if(set_count % 100 == 0){
 		times[times_count] = (double)(end - set_start)/ CLOCKS_PER_SEC;
 		times_count++;
 	 //fprintf(stderr, "%d\n", set_count);
 
-	  }*/
-	/*if(set_count == 9900000){
+	  }
+	 //times_count++;
+	  set_count++;
+
+	if(set_count == 99999){
                 fprintf(stderr, "BEGIN\n");
+		double total = 0;
                 for(int ind = 1; ind < times_count; ind++){
-                                fprintf(out_file, "%f\n", 100/(times[ind] - (times[ind - 1])));
+                                //fprintf(out_file, "%f\n", 100/(times[ind] - (times[ind - 1])));
+				total += 100/(times[ind] - (times[ind - 1]));
                         }
-                        fclose(out_file);
-                        fprintf(stderr, "END\n");
                         //fclose(out_file);
-                }*/
+                        fprintf(stderr, "END\n");
+			fprintf(stderr, "total avg is %f\n", total / times_count);
+                        //fclose(out_file);
+                }
 	//fprintf(stderr, "%d\n", set_count);
 	  /*if(set_count == 10000000){
                 fprintf(stderr, "BEGIN\n");
@@ -2671,8 +2680,7 @@ static void process_bin_append_prepend(conn *c) {
     if (settings.detail_enabled) {
         stats_prefix_record_set(key, nkey);
     }
-    nkey = 250;
-    vlen = -250;
+    fprintf(stderr, "nkey is %d vlen is %d\n", nkey, vlen);
     it = item_alloc(key, nkey, 0, 0, vlen+2);
 
     if (it == 0) {
@@ -3989,7 +3997,7 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
     //rel_time_t exptime = 0;
     bool fail_length = false;
     assert(c != NULL);
-    
+    //clock_t start = clock();
 
     if (should_touch) {
         // For get and touch commands, use first token as exptime
@@ -4160,6 +4168,24 @@ stop:
         c->suffixcurr = c->suffixlist;
         c->suffixleft = si;
     }
+	//printf("END OF READ\n");
+	  /*clock_t end = clock();
+	  double time_here = (double)(end-start)/CLOCKS_PER_SEC;
+	latency_times[set_count - 1] = time_here;
+	  set_count++;
+	 if(set_count == 999999){
+			double total = 0;
+			fprintf(stderr, "BEGIN\n");
+			int ind;
+                        for(ind = 0; ind < 990000; ind++){
+				total += latency_times[ind]*1000000;
+                               // fprintf(out_file, "%f\n", latency_times[ind] * 1000000);
+                        }
+			//fclose(out_file);
+			printf("total is %f\n", total/ind);
+			fprintf(stderr, "END\n");
+                }*/
+
 	/*clock_t end = clock();
           if(set_count % 100 == 0){
                 times[times_count] = (double)(end - set_start)/ CLOCKS_PER_SEC;
@@ -4252,8 +4278,8 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
         stats_prefix_record_set(key, nkey);
     }
     //beginning of set
-    /*start = clock();
-    if(set_count == 0){
+    start = clock();
+    /*if(set_count == 0){
 	out_file = fopen("/home/brian/full_persistent_memcached/persistent-memcached/memcached-1.5.13/throughput3.txt", "w+");
 	if(out_file == NULL){
 		fprintf(stderr, "NOOOO\n");
@@ -7094,6 +7120,7 @@ int main (int argc, char **argv) {
           "F"   /* Disable flush_all */
           "X"   /* Disable dump commands */
           "o:"  /* Extended generic options */
+          "q"   /* Static Analysis Entry Function added by Brian */
           ;
 
     /* process arguments */
@@ -7161,7 +7188,7 @@ int main (int argc, char **argv) {
             settings.udpport = atoi(optarg);
             udp_specified = true;
             break;
-       case 'q':
+        case 'q':
             settings.static_analysis = 1;
             break;
         case 'p':
@@ -8090,6 +8117,7 @@ int main (int argc, char **argv) {
 	size_t sisi2 =  INT_MAX;
 	sisi = 53 * (sisi + sisi2);
         settings.pm_pool = pmemobj_create("/mnt/pmem/memcached.pm", "store.db", sisi/4, 0666);
+        printf("pm pool memcached is %p\n", (void *)settings.pm_pool);
         pmemoid = pmemobj_root(settings.pm_pool, sizeof(uint64_t));
         settings.pool_uuid = pmemoid.pool_uuid_lo;
         uint64_t *num = pmemobj_direct(pmemoid);
@@ -8100,6 +8128,9 @@ int main (int argc, char **argv) {
 	recovery = 1;
         settings.pm_pool = pmemobj_open("/mnt/pmem/memcached.pm", "store.db");
         //const char *error = pmemobj_errormsg();
+        if(!settings.pm_pool){
+          printf("error: %s\n", pmemobj_errormsg());
+        }
         pmemoid = pmemobj_root(settings.pm_pool, sizeof(uint64_t));
         uint64_t *num = pmemobj_direct(pmemoid);
 	settings.pool_uuid = pmemoid.pool_uuid_lo;
@@ -8125,7 +8156,60 @@ int main (int argc, char **argv) {
         //    use_slab_sizes ? slab_sizes : NULL);
 
     }
+    //zzzz
     if(settings.static_analysis){
+      // Declare variables
+      /*conn *c = malloc(sizeof(conn));
+      enum conn_states cs= 0;
+      slabclass_t *p = &slabclass[0];
+      item *it = (item *)p->slots;*/
+
+      // Calling every function in memcached.bc
+      //store_item(it, 0, c);
+      //do_store_item(it, 0  c, 0);
+      /*slabs_alloc(50, 0 , total_bytes, 0);
+      conn_close_idle(c);
+      conn_set_state(c, cs);
+      drive_machine(c);
+      update_event(c, 0);
+      complete_nread(c);
+      conn_release_items(c);
+      conn_cleanup(c);
+      complete_nread_ascii(c);
+      complete_nread_binary(c);
+      process_bin_append_prepend(c);
+      process_bin_update(c);
+      process_bin_get_or_touch(c);
+      process_bin_stat(c);
+      process_bin_delete(c);
+      complete_incr_bin(c);
+      process_bin_flush(c);
+      process_command(c,"aa"); */
+
+      //item functions
+      /*do_item_alloc_pull(0,0);
+      do_item_unlink_nolock(it, 0);
+      do_item_remove(it);
+      do_item_update_nolock(it);
+      item_link(it);
+      item_free(it);
+      do_item_alloc("key", 3, 0,0,0);
+      do_item_link(it, 0);
+      do_item_unlink(it, 0);
+      do_item_update(it);
+      do_item_replace(it, it, 0);
+      do_item_get("key", 0, 0, c, false);
+      do_item_touch("key", 0, 0, 0, c);
+      item_lock(0);
+      item_unlock(0);
+      item_alloc("key", 3, 0, 0, 0);
+      item_get("key", 3, c, false);
+      item_touch("key", 3, 0, 0);
+      item_link(it);
+      item_remove(it);
+      item_unlink(it);
+      store_item(it, 0, c);*/
+       
       //assoc functions
       assoc_find("key", 3, 0);
       /*assoc_start_expand(0);
@@ -8133,6 +8217,9 @@ int main (int argc, char **argv) {
       assoc_delete("key", 3, 0);
       start_assoc_maintenance_thread();*/
     }
+
+
+    //uint64_t *total_bytes = malloc(sizeof(uint64_t));
 #ifdef EXTSTORE
     if (storage_file) {
         enum extstore_res eres;
@@ -8312,6 +8399,7 @@ int main (int argc, char **argv) {
 
     /* cleanup base */
     event_base_free(main_base);
+
 
     return retval;
 }
